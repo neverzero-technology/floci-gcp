@@ -15,6 +15,7 @@ import io.floci.gcp.services.iam.authorization.IamAuthorizationService;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.floci.gcp.services.secretmanager.model.StoredSecret;
+import io.floci.gcp.services.secretmanager.model.StoredSecretReplica;
 import io.floci.gcp.services.secretmanager.model.StoredSecretVersion;
 import io.grpc.stub.StreamObserver;
 import jakarta.enterprise.inject.Instance;
@@ -22,11 +23,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -45,6 +49,10 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class SecretManagerServiceTest {
+
+    private static final String KEY_EUROPE_WEST1 =
+            "projects/kms-project/locations/europe-west1/keyRings/ring/cryptoKeys/secrets";
+    private static final String KEY_GLOBAL = "projects/kms-project/locations/global/keyRings/ring/cryptoKeys/secrets";
 
     private SecretManagerService service;
 
@@ -79,7 +87,7 @@ class SecretManagerServiceTest {
         SecretManagerService tested = new SecretManagerService(new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), policies, authorization, adapter);
         String resource = "projects/p1/secrets/revoked";
-        tested.createSecret("p1", "revoked", "automatic");
+        tested.createSecret("p1", "revoked", new StoredSecret());
 
         Instance<SecretManagerService> secretManager = mock(Instance.class);
         when(secretManager.get()).thenReturn(tested);
@@ -171,7 +179,7 @@ class SecretManagerServiceTest {
             try {
                 Future<StoredSecret> create = executor.submit(() -> {
                     createThread.set(Thread.currentThread());
-                    return tested.createSecret("p1", "recovery-0", "automatic");
+                    return tested.createSecret("p1", "recovery-0", new StoredSecret());
                 });
                 assertTrue(createEnteredLocks.await(5, TimeUnit.SECONDS));
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -216,7 +224,7 @@ class SecretManagerServiceTest {
                 authorization, new SecretManagerIamAuthorizationAdapter());
         String name = "projects/p1/secrets/recreated";
         String version = name + "/versions/1";
-        tested.createSecret("p1", "recreated", "automatic");
+        tested.createSecret("p1", "recreated", new StoredSecret());
         tested.addSecretVersion(name, new byte[]{1}, null);
 
         try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
@@ -225,7 +233,7 @@ class SecretManagerServiceTest {
             Future<?> replace = executor.submit(() -> {
                 replacementThread.set(Thread.currentThread());
                 tested.deleteSecret(name);
-                tested.createSecret("p1", "recreated", "automatic");
+                tested.createSecret("p1", "recreated", new StoredSecret());
                 tested.addSecretVersion(name, new byte[]{2}, null);
             });
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -262,7 +270,7 @@ class SecretManagerServiceTest {
 
     @Test
     void createSecretStoredAndRetrievable() {
-        service.createSecret("p1", "my-secret", "automatic");
+        service.createSecret("p1", "my-secret", new StoredSecret());
 
         StoredSecret secret = service.getSecret("projects/p1/secrets/my-secret");
         assertEquals("projects/p1/secrets/my-secret", secret.getName());
@@ -270,11 +278,157 @@ class SecretManagerServiceTest {
 
     @Test
     void createSecretDuplicateThrowsAlreadyExists() {
-        service.createSecret("p1", "my-secret", "automatic");
+        service.createSecret("p1", "my-secret", new StoredSecret());
 
         GcpException ex = assertThrows(GcpException.class,
-                () -> service.createSecret("p1", "my-secret", "automatic"));
+                () -> service.createSecret("p1", "my-secret", new StoredSecret()));
         assertEquals("ALREADY_EXISTS", ex.getGcpStatus());
+    }
+
+    @Test
+    void createSecretKeepsUserManagedReplicasWithCustomerManagedEncryption() {
+        StoredSecret requested = userManaged(
+                new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1),
+                new StoredSecretReplica("europe-west2", null));
+        requested.setLabels(new LinkedHashMap<>(Map.of("team", "a")));
+        requested.setAnnotations(new LinkedHashMap<>(Map.of("owner", "platform")));
+
+        service.createSecret("p1", "replicated", requested);
+        requested.getReplicas().clear();
+        requested.getLabels().clear();
+
+        StoredSecret secret = service.getSecret("projects/p1/secrets/replicated");
+        assertEquals(StoredSecret.USER_MANAGED, secret.getReplicationType());
+        assertEquals(List.of(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1),
+                new StoredSecretReplica("europe-west2", null)), secret.getReplicas());
+        assertEquals(Map.of("team", "a"), secret.getLabels());
+        assertEquals(Map.of("owner", "platform"), secret.getAnnotations());
+    }
+
+    @Test
+    void createSecretKeepsAutomaticCustomerManagedEncryption() {
+        StoredSecret requested = new StoredSecret();
+        requested.setReplicationType(StoredSecret.AUTOMATIC);
+        requested.setAutomaticKmsKeyName(KEY_GLOBAL);
+
+        service.createSecret("p1", "automatic-cmek", requested);
+
+        StoredSecret secret = service.getSecret("projects/p1/secrets/automatic-cmek");
+        assertEquals(StoredSecret.AUTOMATIC, secret.getReplicationType());
+        assertEquals(KEY_GLOBAL, secret.getAutomaticKmsKeyName());
+    }
+
+    @Test
+    void createSecretWithoutReplicationDefaultsToAutomatic() {
+        assertEquals(StoredSecret.AUTOMATIC,
+                service.createSecret("p1", "defaulted", new StoredSecret()).getReplicationType());
+    }
+
+    @Test
+    void createSecretRejectsUserManagedReplicationWithoutReplicas() {
+        GcpException ex = assertThrows(GcpException.class,
+                () -> service.createSecret("p1", "no-replicas", userManaged()));
+
+        assertEquals("INVALID_ARGUMENT", ex.getGcpStatus());
+        assertTrue(service.listSecrets("p1").isEmpty());
+    }
+
+    @Test
+    void createSecretRejectsReplicaWithoutLocation() {
+        GcpException ex = assertThrows(GcpException.class,
+                () -> service.createSecret("p1", "no-location", userManaged(new StoredSecretReplica("", null))));
+
+        assertEquals("INVALID_ARGUMENT", ex.getGcpStatus());
+        assertTrue(service.listSecrets("p1").isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "",
+            "projects/p/locations/europe-west1/keyRings/r",
+            "projects/p/locations/europe-west1/keyRings/r/cryptoKeys/",
+            "projects/p/locations/europe-west1/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+            "locations/europe-west1/keyRings/r/cryptoKeys/k"})
+    void createSecretRejectsMalformedKmsKeyName(String kmsKeyName) {
+        GcpException replica = assertThrows(GcpException.class, () -> service.createSecret("p1", "bad-replica",
+                userManaged(new StoredSecretReplica("europe-west1", kmsKeyName))));
+        StoredSecret automatic = new StoredSecret();
+        automatic.setReplicationType(StoredSecret.AUTOMATIC);
+        automatic.setAutomaticKmsKeyName(kmsKeyName);
+        GcpException auto = assertThrows(GcpException.class,
+                () -> service.createSecret("p1", "bad-automatic", automatic));
+
+        assertEquals("INVALID_ARGUMENT", replica.getGcpStatus());
+        assertEquals("INVALID_ARGUMENT", auto.getGcpStatus());
+        assertTrue(service.listSecrets("p1").isEmpty());
+    }
+
+    @Test
+    void updateSecretAppliesOnlyMaskedLabelsAndAnnotations() {
+        StoredSecret requested = userManaged(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1));
+        requested.setLabels(Map.of("team", "a"));
+        requested.setAnnotations(Map.of("owner", "platform"));
+        service.createSecret("p1", "patched", requested);
+        String name = "projects/p1/secrets/patched";
+
+        StoredSecret patch = labelled("team", "b");
+        patch.setAnnotations(Map.of("owner", "ignored"));
+        service.updateSecret(name, patch, List.of("labels"));
+
+        StoredSecret afterLabels = service.getSecret(name);
+        assertEquals(Map.of("team", "b"), afterLabels.getLabels());
+        assertEquals(Map.of("owner", "platform"), afterLabels.getAnnotations());
+        assertEquals(List.of(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1)), afterLabels.getReplicas());
+
+        service.updateSecret(name, new StoredSecret(), List.of("labels", "annotations"));
+
+        StoredSecret cleared = service.getSecret(name);
+        assertNull(cleared.getLabels());
+        assertNull(cleared.getAnnotations());
+    }
+
+    @Test
+    void updateSecretWithEmptyMaskChangesNothing() {
+        StoredSecret requested = labelled("team", "a");
+        service.createSecret("p1", "unmasked", requested);
+
+        StoredSecret returned = service.updateSecret("projects/p1/secrets/unmasked", labelled("team", "b"), List.of());
+
+        assertEquals(Map.of("team", "a"), returned.getLabels());
+        assertEquals(Map.of("team", "a"), service.getSecret("projects/p1/secrets/unmasked").getLabels());
+    }
+
+    @Test
+    void updateSecretRejectsReplicationChangeWithoutApplyingOtherPaths() {
+        StoredSecret requested = userManaged(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1));
+        requested.setLabels(Map.of("team", "a"));
+        service.createSecret("p1", "immutable", requested);
+        String name = "projects/p1/secrets/immutable";
+
+        StoredSecret patch = userManaged(new StoredSecretReplica("europe-west2", null));
+        patch.setLabels(Map.of("team", "b"));
+        GcpException changed = assertThrows(GcpException.class,
+                () -> service.updateSecret(name, patch, List.of("labels", "replication")));
+        GcpException cleared = assertThrows(GcpException.class,
+                () -> service.updateSecret(name, new StoredSecret(), List.of("replication")));
+
+        assertEquals("INVALID_ARGUMENT", changed.getGcpStatus());
+        assertEquals("INVALID_ARGUMENT", cleared.getGcpStatus());
+        StoredSecret stored = service.getSecret(name);
+        assertEquals(Map.of("team", "a"), stored.getLabels());
+        assertEquals(List.of(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1)), stored.getReplicas());
+    }
+
+    @Test
+    void updateSecretAcceptsUnchangedReplicationInMask() {
+        service.createSecret("p1", "same", userManaged(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1)));
+
+        StoredSecret patch = userManaged(new StoredSecretReplica("europe-west1", KEY_EUROPE_WEST1));
+        patch.setLabels(Map.of("team", "b"));
+        StoredSecret updated = service.updateSecret("projects/p1/secrets/same", patch,
+                List.of("replication", "labels"));
+
+        assertEquals(Map.of("team", "b"), updated.getLabels());
     }
 
     @Test
@@ -286,7 +440,7 @@ class SecretManagerServiceTest {
 
     @Test
     void addSecretVersionCreatesEnabledVersionWithIncrementingNumber() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
 
         byte[] payload = "value1".getBytes(StandardCharsets.UTF_8);
         StoredSecretVersion v1 = service.addSecretVersion("projects/p1/secrets/s1", payload, null);
@@ -300,7 +454,7 @@ class SecretManagerServiceTest {
 
     @Test
     void accessSecretVersionLatestReturnsPayload() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
         byte[] payload = "my-password".getBytes(StandardCharsets.UTF_8);
         service.addSecretVersion("projects/p1/secrets/s1", payload, null);
 
@@ -311,7 +465,7 @@ class SecretManagerServiceTest {
 
     @Test
     void accessDisabledVersionThrowsFailedPrecondition() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
         service.addSecretVersion("projects/p1/secrets/s1", new byte[]{1}, null);
         service.disableSecretVersion("projects/p1/secrets/s1/versions/1");
 
@@ -323,7 +477,7 @@ class SecretManagerServiceTest {
 
     @Test
     void accessDestroyedVersionThrowsFailedPrecondition() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
         service.addSecretVersion("projects/p1/secrets/s1", new byte[]{1}, null);
         service.destroySecretVersion("projects/p1/secrets/s1/versions/1");
 
@@ -335,7 +489,7 @@ class SecretManagerServiceTest {
 
     @Test
     void destroySecretVersionClearsPayload() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
         service.addSecretVersion("projects/p1/secrets/s1", new byte[]{1, 2, 3}, null);
 
         StoredSecretVersion destroyed = service.disableSecretVersion(
@@ -345,7 +499,7 @@ class SecretManagerServiceTest {
 
     @Test
     void enableSecretVersionAllowsAccess() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
         byte[] payload = "re-enabled".getBytes(StandardCharsets.UTF_8);
         service.addSecretVersion("projects/p1/secrets/s1", payload, null);
         service.disableSecretVersion("projects/p1/secrets/s1/versions/1");
@@ -358,7 +512,7 @@ class SecretManagerServiceTest {
 
     @Test
     void deleteSecretCascadesVersions() {
-        service.createSecret("p1", "s1", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
         service.addSecretVersion("projects/p1/secrets/s1", new byte[]{1}, null);
 
         service.deleteSecret("projects/p1/secrets/s1");
@@ -373,8 +527,8 @@ class SecretManagerServiceTest {
 
     @Test
     void listSecretsFiltersByProject() {
-        service.createSecret("p1", "s1", "automatic");
-        service.createSecret("p1", "s2", "automatic");
+        service.createSecret("p1", "s1", new StoredSecret());
+        service.createSecret("p1", "s2", new StoredSecret());
 
         List<StoredSecret> secrets = service.listSecrets("p1");
         assertEquals(2, secrets.size());
@@ -384,7 +538,7 @@ class SecretManagerServiceTest {
     @Test
     void iamPolicyRoundTripsRejectsStaleEtagAndIsClearedOnDelete() {
         String resource = "projects/p1/secrets/iam-target";
-        service.createSecret("p1", "iam-target", "automatic");
+        service.createSecret("p1", "iam-target", new StoredSecret());
 
         Policy saved = service.setIamPolicy(resource, Policy.newBuilder()
                 .addBindings(Binding.newBuilder()
@@ -402,7 +556,7 @@ class SecretManagerServiceTest {
         service.deleteSecret(resource);
         assertThrows(GcpException.class, () -> service.getIamPolicy(resource));
 
-        service.createSecret("p1", "iam-target", "automatic");
+        service.createSecret("p1", "iam-target", new StoredSecret());
         assertTrue(service.getIamPolicy(resource).getBindingsList().isEmpty());
     }
 
@@ -412,7 +566,7 @@ class SecretManagerServiceTest {
         var deletions = new FailingCheckpointStorage();
         SecretManagerService failingService = new SecretManagerService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), deletions, IamServices.inMemory());
-        failingService.createSecret("p1", "checkpoint-failure", "automatic");
+        failingService.createSecret("p1", "checkpoint-failure", new StoredSecret());
         failingService.setIamPolicy(resource, Policy.newBuilder()
                 .addBindings(Binding.newBuilder().setRole("roles/secretmanager.secretAccessor")
                         .addMembers("user:reader@example.com"))
@@ -422,7 +576,7 @@ class SecretManagerServiceTest {
         assertEquals("UNAVAILABLE", failure.getGcpStatus());
         assertThrows(GcpException.class, () -> failingService.getSecret(resource));
 
-        failingService.createSecret("p1", "checkpoint-failure", "automatic");
+        failingService.createSecret("p1", "checkpoint-failure", new StoredSecret());
         assertTrue(failingService.getIamPolicy(resource).getBindingsList().isEmpty());
     }
 
@@ -440,7 +594,7 @@ class SecretManagerServiceTest {
         var policies = new FailingCheckpointStorage<String, StoredPolicy>(boundary == DeletionBoundary.POLICY ? 1 : 0);
         SecretManagerService tested = new SecretManagerService(secrets, versions, deletions,
                 IamServices.withStores(new InMemoryStorage<>(), new InMemoryStorage<>(), policies));
-        tested.createSecret("p1", "boundary", "automatic");
+        tested.createSecret("p1", "boundary", new StoredSecret());
         tested.addSecretVersion(resource, new byte[]{1}, null);
         tested.setIamPolicy(resource, policyWithBinding());
 
@@ -451,7 +605,7 @@ class SecretManagerServiceTest {
         assertThrows(GcpException.class, () -> tested.getSecret(resource));
         assertTrue(tested.listSecrets("p1").isEmpty());
 
-        tested.createSecret("p1", "boundary", "automatic");
+        tested.createSecret("p1", "boundary", new StoredSecret());
 
         assertTrue(deletions.get(resource).isEmpty());
         assertTrue(tested.listSecretVersions(resource).isEmpty());
@@ -468,7 +622,7 @@ class SecretManagerServiceTest {
         SecretManagerService tested = new SecretManagerService(secrets, versions, deletions,
                 IamServices.withStores(new InMemoryStorage<>(), new InMemoryStorage<>(), policies));
         String resource = "projects/p1/secrets/ordered";
-        tested.createSecret("p1", "ordered", "automatic");
+        tested.createSecret("p1", "ordered", new StoredSecret());
 
         tested.deleteSecret(resource);
 
@@ -481,14 +635,14 @@ class SecretManagerServiceTest {
         SecretManagerService tested = new SecretManagerService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), deletions, IamServices.inMemory());
         String resource = "projects/p1/secrets/race";
-        tested.createSecret("p1", "race", "automatic");
+        tested.createSecret("p1", "race", new StoredSecret());
         tested.addSecretVersion(resource, new byte[]{1}, null);
         tested.setIamPolicy(resource, policyWithBinding());
 
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<?> delete = executor.submit(() -> tested.deleteSecret(resource));
             assertTrue(deletions.awaitCheckpoint());
-            Future<StoredSecret> recreate = executor.submit(() -> tested.createSecret("p1", "race", "automatic"));
+            Future<StoredSecret> recreate = executor.submit(() -> tested.createSecret("p1", "race", new StoredSecret()));
             assertTimeoutPreemptively(Duration.ofMillis(200), () -> assertFalse(recreate.isDone()));
 
             deletions.releaseCheckpoint();
@@ -507,7 +661,7 @@ class SecretManagerServiceTest {
                 new InMemoryStorage<>(), new InMemoryStorage<>(), deletions, IamServices.inMemory());
         String resource = "projects/p1/secrets/race";
         String version = resource + "/versions/1";
-        tested.createSecret("p1", "race", "automatic");
+        tested.createSecret("p1", "race", new StoredSecret());
         tested.addSecretVersion(resource, new byte[]{1}, null);
         tested.setIamPolicy(resource, policyWithBinding());
 
@@ -516,7 +670,7 @@ class SecretManagerServiceTest {
             assertTrue(deletions.awaitCheckpoint());
             List<Future<?>> blocked = List.of(
                     executor.submit(() -> tested.getSecret(resource)),
-                    executor.submit(() -> tested.updateSecret(resource)),
+                    executor.submit(() -> tested.updateSecret(resource, labelled("team", "a"), List.of("labels"))),
                     executor.submit(() -> tested.addSecretVersion(resource, new byte[]{2}, null)),
                     executor.submit(() -> tested.getSecretVersion(version)),
                     executor.submit(() -> tested.listSecretVersions(resource)),
@@ -538,7 +692,21 @@ class SecretManagerServiceTest {
                 assertNotFound(operation);
             }
             assertTrue(permissions.get(5, TimeUnit.SECONDS).isEmpty());
+            assertTrue(tested.listSecrets("p1").isEmpty());
         }
+    }
+
+    private static StoredSecret userManaged(StoredSecretReplica... replicas) {
+        StoredSecret secret = new StoredSecret();
+        secret.setReplicationType(StoredSecret.USER_MANAGED);
+        secret.setReplicas(new ArrayList<>(List.of(replicas)));
+        return secret;
+    }
+
+    private static StoredSecret labelled(String key, String value) {
+        StoredSecret secret = new StoredSecret();
+        secret.setLabels(Map.of(key, value));
+        return secret;
     }
 
     private static Policy policyWithBinding() {
@@ -647,7 +815,7 @@ class SecretManagerServiceTest {
     @Test
     void testIamPermissionsEchoesRequestedPermissionsForExistingSecret() {
         String resource = "projects/p1/secrets/permission-target";
-        service.createSecret("p1", "permission-target", "automatic");
+        service.createSecret("p1", "permission-target", new StoredSecret());
 
         assertEquals(List.of("secretmanager.secrets.get", "secretmanager.secrets.delete"),
                 service.testIamPermissions(resource,

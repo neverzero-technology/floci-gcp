@@ -4,6 +4,7 @@ import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.ProtoJsonBytes;
 import io.floci.gcp.services.iam.IamPolicyCodec;
 import io.floci.gcp.services.secretmanager.model.StoredSecret;
+import io.floci.gcp.services.secretmanager.model.StoredSecretReplica;
 import io.floci.gcp.services.secretmanager.model.StoredSecretVersion;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -20,6 +21,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -58,8 +60,7 @@ public class SecretManagerHttpController {
             return gcpError(400, "secretId is required", "INVALID_ARGUMENT");
         }
         try {
-            String replicationType = extractReplicationType(body);
-            StoredSecret stored = service.createSecret(project, secretId, replicationType);
+            StoredSecret stored = service.createSecret(project, secretId, requestedSecret(body));
             return Response.ok(toSecretJson(stored)).build();
         } catch (GcpException e) {
             return gcpError(grpcToHttpCode(e), e.getMessage(), e.getGrpcCode().name());
@@ -97,10 +98,12 @@ public class SecretManagerHttpController {
     @Path("/{secretId}")
     public Response updateSecret(@PathParam("project") String project,
                                  @PathParam("secretId") String secretId,
+                                 @QueryParam("updateMask") String updateMask,
                                  Map<String, Object> body) {
-        LOG.debugf("REST updateSecret project=%s secretId=%s", project, secretId);
+        LOG.debugf("REST updateSecret project=%s secretId=%s updateMask=%s", project, secretId, updateMask);
         try {
-            StoredSecret stored = service.updateSecret("projects/" + project + "/secrets/" + secretId);
+            StoredSecret stored = service.updateSecret("projects/" + project + "/secrets/" + secretId,
+                    requestedSecret(body), updateMaskPaths(updateMask));
             return Response.ok(toSecretJson(stored)).build();
         } catch (GcpException e) {
             return gcpError(grpcToHttpCode(e), e.getMessage(), e.getGrpcCode().name());
@@ -299,14 +302,34 @@ public class SecretManagerHttpController {
         response.put("name", stored.getName());
         response.put("createTime", stored.getCreateTime());
         Map<String, Object> replication = new LinkedHashMap<>();
-        if ("user_managed".equals(stored.getReplicationType())) {
-            replication.put("userManaged", Map.of());
+        if (stored.usesUserManagedReplication()) {
+            Map<String, Object> userManaged = new LinkedHashMap<>();
+            if (stored.getReplicas() != null) {
+                List<Map<String, Object>> replicas = new ArrayList<>();
+                for (StoredSecretReplica replica : stored.getReplicas()) {
+                    Map<String, Object> replicaJson = new LinkedHashMap<>();
+                    replicaJson.put("location", replica.getLocation());
+                    if (replica.getKmsKeyName() != null) {
+                        replicaJson.put("customerManagedEncryption", Map.of("kmsKeyName", replica.getKmsKeyName()));
+                    }
+                    replicas.add(replicaJson);
+                }
+                userManaged.put("replicas", replicas);
+            }
+            replication.put("userManaged", userManaged);
         } else {
-            replication.put("automatic", Map.of());
+            Map<String, Object> automatic = new LinkedHashMap<>();
+            if (stored.getAutomaticKmsKeyName() != null) {
+                automatic.put("customerManagedEncryption", Map.of("kmsKeyName", stored.getAutomaticKmsKeyName()));
+            }
+            replication.put("automatic", automatic);
         }
         response.put("replication", replication);
         if (stored.getLabels() != null && !stored.getLabels().isEmpty()) {
             response.put("labels", stored.getLabels());
+        }
+        if (stored.getAnnotations() != null && !stored.getAnnotations().isEmpty()) {
+            response.put("annotations", stored.getAnnotations());
         }
         return response;
     }
@@ -338,16 +361,119 @@ public class SecretManagerHttpController {
 
     // ── Request body helpers ───────────────────────────────────────────────────
 
-    @SuppressWarnings("unchecked")
-    private static String extractReplicationType(Map<String, Object> body) {
+    private static StoredSecret requestedSecret(Map<String, Object> body) {
+        StoredSecret secret = new StoredSecret();
         if (body == null) {
-            return "automatic";
+            return secret;
         }
-        Map<String, Object> replication = (Map<String, Object>) body.get("replication");
-        if (replication != null && replication.containsKey("userManaged")) {
-            return "user_managed";
+        Map<String, Object> replication = jsonObject(body.get("replication"), "replication");
+        if (replication != null) {
+            Map<String, Object> automatic = jsonObject(replication.get("automatic"), "replication.automatic");
+            Map<String, Object> userManaged = jsonObject(member(replication, "userManaged", "user_managed"),
+                    "replication.userManaged");
+            if (automatic != null && userManaged != null) {
+                throw GcpException.invalidArgument(
+                        "Only one of replication.automatic and replication.userManaged may be set");
+            }
+            if (userManaged != null) {
+                secret.setReplicationType(StoredSecret.USER_MANAGED);
+                secret.setReplicas(replicas(userManaged.get("replicas")));
+            } else {
+                secret.setReplicationType(StoredSecret.AUTOMATIC);
+                if (automatic != null) {
+                    secret.setAutomaticKmsKeyName(kmsKeyName(
+                            member(automatic, "customerManagedEncryption", "customer_managed_encryption"),
+                            "replication.automatic.customerManagedEncryption"));
+                }
+            }
         }
-        return "automatic";
+        secret.setLabels(stringMap(body.get("labels"), "labels"));
+        secret.setAnnotations(stringMap(body.get("annotations"), "annotations"));
+        return secret;
+    }
+
+    private static List<StoredSecretReplica> replicas(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof List<?> list)) {
+            throw GcpException.invalidArgument("replication.userManaged.replicas must be an array");
+        }
+        List<StoredSecretReplica> replicas = new ArrayList<>();
+        for (Object item : list) {
+            Map<String, Object> replica = jsonObject(item, "replication.userManaged.replicas[]");
+            if (replica == null) {
+                throw GcpException.invalidArgument("replication.userManaged.replicas[] must not contain null");
+            }
+            Object location = replica.get("location");
+            if (location != null && !(location instanceof String)) {
+                throw GcpException.invalidArgument("replication.userManaged.replicas[].location must be a string");
+            }
+            String kmsKeyName = kmsKeyName(
+                    member(replica, "customerManagedEncryption", "customer_managed_encryption"),
+                    "replication.userManaged.replicas[].customerManagedEncryption");
+            replicas.add(new StoredSecretReplica((String) location, kmsKeyName));
+        }
+        return replicas;
+    }
+
+    private static String kmsKeyName(Object value, String field) {
+        Map<String, Object> encryption = jsonObject(value, field);
+        if (encryption == null) {
+            return null;
+        }
+        Object kmsKeyName = member(encryption, "kmsKeyName", "kms_key_name");
+        if (kmsKeyName == null) {
+            return "";
+        }
+        if (!(kmsKeyName instanceof String name)) {
+            throw GcpException.invalidArgument(field + ".kmsKeyName must be a string");
+        }
+        return name;
+    }
+
+    private static Object member(Map<String, Object> object, String jsonName, String protoName) {
+        Object value = object.get(jsonName);
+        return value != null ? value : object.get(protoName);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> jsonObject(Object value, String field) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?>)) {
+            throw GcpException.invalidArgument(field + " must be an object");
+        }
+        return (Map<String, Object>) value;
+    }
+
+    private static Map<String, String> stringMap(Object value, String field) {
+        Map<String, Object> object = jsonObject(value, field);
+        if (object == null) {
+            return null;
+        }
+        Map<String, String> values = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : object.entrySet()) {
+            if (!(entry.getValue() instanceof String string)) {
+                throw GcpException.invalidArgument(field + "." + entry.getKey() + " must be a string");
+            }
+            values.put(entry.getKey(), string);
+        }
+        return values;
+    }
+
+    private static List<String> updateMaskPaths(String updateMask) {
+        if (updateMask == null || updateMask.isBlank()) {
+            return List.of();
+        }
+        List<String> paths = new ArrayList<>();
+        for (String path : updateMask.split(",")) {
+            if (!path.isBlank()) {
+                paths.add(path.trim());
+            }
+        }
+        return paths;
     }
 
     @SuppressWarnings("unchecked")

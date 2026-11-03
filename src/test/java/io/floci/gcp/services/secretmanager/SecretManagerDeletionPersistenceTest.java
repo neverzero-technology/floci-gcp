@@ -11,12 +11,14 @@ import io.floci.gcp.core.storage.WalStorage;
 import io.floci.gcp.services.iam.IamServices;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.floci.gcp.services.secretmanager.model.StoredSecret;
+import io.floci.gcp.services.secretmanager.model.StoredSecretReplica;
 import io.floci.gcp.services.secretmanager.model.StoredSecretVersion;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -36,7 +38,7 @@ class SecretManagerDeletionPersistenceTest {
         String resource = "projects/p1/secrets/recovery";
         Stores initial = openStores(mode);
         SecretManagerService service = initial.service();
-        service.createSecret("p1", "recovery", "automatic");
+        service.createSecret("p1", "recovery", new StoredSecret());
         service.addSecretVersion(resource, new byte[]{1, 2, 3}, null);
         service.setIamPolicy(resource, Policy.newBuilder()
                 .addBindings(Binding.newBuilder().setRole("roles/secretmanager.secretAccessor")
@@ -66,10 +68,39 @@ class SecretManagerDeletionPersistenceTest {
         assertTrue(verified.deletions.get(resource).isEmpty());
 
         SecretManagerService verifiedService = verified.service();
-        verifiedService.createSecret("p1", "recovery", "automatic");
+        verifiedService.createSecret("p1", "recovery", new StoredSecret());
         assertTrue(verifiedService.listSecretVersions(resource).isEmpty());
         assertTrue(verifiedService.getIamPolicy(resource).getBindingsList().isEmpty());
         verified.close();
+    }
+
+    @ParameterizedTest
+    @EnumSource(StorageMode.class)
+    void replicationLabelsAndAnnotationsSurviveRestart(StorageMode mode) {
+        String resource = "projects/p1/secrets/replicated";
+        String key = "projects/kms/locations/europe-west1/keyRings/ring/cryptoKeys/secrets";
+        StoredSecret requested = new StoredSecret();
+        requested.setReplicationType(StoredSecret.USER_MANAGED);
+        requested.setReplicas(List.of(new StoredSecretReplica("europe-west1", key),
+                new StoredSecretReplica("europe-west2", null)));
+        requested.setAnnotations(Map.of("owner", "platform"));
+        Stores initial = openStores(mode);
+        SecretManagerService service = initial.service();
+        service.createSecret("p1", "replicated", requested);
+        StoredSecret labels = new StoredSecret();
+        labels.setLabels(Map.of("team", "b"));
+        service.updateSecret(resource, labels, List.of("labels"));
+        initial.secrets.checkpoint();
+        initial.close();
+
+        Stores restarted = openStores(mode);
+        StoredSecret reloaded = restarted.service().getSecret(resource);
+        assertEquals(StoredSecret.USER_MANAGED, reloaded.getReplicationType());
+        assertEquals(List.of(new StoredSecretReplica("europe-west1", key),
+                new StoredSecretReplica("europe-west2", null)), reloaded.getReplicas());
+        assertEquals(Map.of("team", "b"), reloaded.getLabels());
+        assertEquals(Map.of("owner", "platform"), reloaded.getAnnotations());
+        restarted.close();
     }
 
     private Stores openStores(StorageMode mode) {

@@ -18,6 +18,7 @@ import io.floci.gcp.services.iam.authorization.IamAuthorizationService;
 import io.floci.gcp.services.iam.authorization.IamOperation;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.floci.gcp.services.secretmanager.model.StoredSecret;
+import io.floci.gcp.services.secretmanager.model.StoredSecretReplica;
 import io.floci.gcp.services.secretmanager.model.StoredSecretVersion;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -28,15 +29,19 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class SecretManagerService {
 
     private static final Logger LOG = Logger.getLogger(SecretManagerService.class);
     private static final int SECRET_LOCK_STRIPES = 256;
+    private static final Pattern KMS_KEY_NAME =
+            Pattern.compile("projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+");
     private final Object[] secretLocks = createSecretLocks();
 
     private final StorageBackend<String, StoredSecret> secretStore;
@@ -110,11 +115,12 @@ public class SecretManagerService {
 
     // ── Secrets ────────────────────────────────────────────────────────────────
 
-    public StoredSecret createSecret(String project, String secretId, String replicationType) {
+    public StoredSecret createSecret(String project, String secretId, StoredSecret requested) {
         String name = "projects/" + project + "/secrets/" + secretId;
         LOG.infof("createSecret name=%s", name);
         synchronized (secretLock(name)) {
             return authorized("CreateSecret", "projects/" + project, name, () -> {
+                validateReplication(requested);
                 try {
                     resumePendingDeletion(name);
                 } catch (StorageException e) {
@@ -123,7 +129,12 @@ public class SecretManagerService {
                 if (secretStore.get(name).isPresent()) {
                     throw GcpException.alreadyExists("Secret already exists: " + name);
                 }
-                StoredSecret secret = new StoredSecret(name, Instant.now().toString(), replicationType);
+                StoredSecret secret = requested.copy();
+                secret.setName(name);
+                secret.setCreateTime(Instant.now().toString());
+                if (secret.getReplicationType() == null) {
+                    secret.setReplicationType(StoredSecret.AUTOMATIC);
+                }
                 secretStore.put(name, secret);
                 return secret;
             });
@@ -152,10 +163,34 @@ public class SecretManagerService {
                 () -> secretStore.scan(k -> k.startsWith(prefix) && pendingDeletionStore.get(k).isEmpty()));
     }
 
-    public StoredSecret updateSecret(String name) {
-        LOG.debugf("updateSecret name=%s", name);
+    public StoredSecret updateSecret(String name, StoredSecret requested, List<String> updateMask) {
+        LOG.debugf("updateSecret name=%s updateMask=%s", name, updateMask);
         synchronized (secretLock(name)) {
-            return authorized("UpdateSecret", name, () -> requireSecretExists(name));
+            return authorized("UpdateSecret", name, () -> {
+                StoredSecret existing = requireSecretExists(name);
+                StoredSecret updated = existing.copy();
+                boolean changed = false;
+                for (String path : updateMask) {
+                    if (path.equals("labels")) {
+                        updated.setLabels(copyOrNull(requested.getLabels()));
+                        changed = true;
+                    } else if (path.equals("annotations")) {
+                        updated.setAnnotations(copyOrNull(requested.getAnnotations()));
+                        changed = true;
+                    } else if (path.equals("replication") || path.startsWith("replication.")) {
+                        if (requested.getReplicationType() == null || !existing.sameReplicationAs(requested)) {
+                            throw GcpException.invalidArgument(
+                                    "Secret replication is immutable and cannot be changed after creation: " + name);
+                        }
+                    } else {
+                        LOG.debugf("updateSecret ignores unsupported update mask path %s", path);
+                    }
+                }
+                if (changed) {
+                    secretStore.put(name, updated);
+                }
+                return updated;
+            });
         }
     }
 
@@ -328,6 +363,34 @@ public class SecretManagerService {
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private static void validateReplication(StoredSecret requested) {
+        if (requested.usesUserManagedReplication()) {
+            List<StoredSecretReplica> replicas = requested.getReplicas();
+            if (replicas == null || replicas.isEmpty()) {
+                throw GcpException.invalidArgument("replication.user_managed.replicas must not be empty");
+            }
+            for (StoredSecretReplica replica : replicas) {
+                if (replica.getLocation() == null || replica.getLocation().isBlank()) {
+                    throw GcpException.invalidArgument("replication.user_managed.replicas.location is required");
+                }
+                validateKmsKeyName(replica.getKmsKeyName());
+            }
+        } else {
+            validateKmsKeyName(requested.getAutomaticKmsKeyName());
+        }
+    }
+
+    private static void validateKmsKeyName(String kmsKeyName) {
+        if (kmsKeyName != null && !KMS_KEY_NAME.matcher(kmsKeyName).matches()) {
+            throw GcpException.invalidArgument("Invalid customer_managed_encryption.kms_key_name '" + kmsKeyName
+                    + "': expected projects/*/locations/*/keyRings/*/cryptoKeys/*");
+        }
+    }
+
+    private static Map<String, String> copyOrNull(Map<String, String> values) {
+        return values != null ? new LinkedHashMap<>(values) : null;
+    }
 
     private int nextVersionNumber(String secretName) {
         String prefix = secretName + "/versions/";
