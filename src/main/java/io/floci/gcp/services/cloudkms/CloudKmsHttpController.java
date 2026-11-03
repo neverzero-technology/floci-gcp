@@ -13,6 +13,7 @@ import io.floci.gcp.services.cloudkms.model.StoredCryptoKey;
 import io.floci.gcp.services.cloudkms.model.StoredCryptoKeyVersion;
 import io.floci.gcp.services.cloudkms.model.StoredImportJob;
 import io.floci.gcp.services.cloudkms.model.StoredKeyRing;
+import io.floci.gcp.services.iam.IamPolicyCodec;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -178,6 +179,136 @@ public class CloudKmsHttpController {
         } catch (GcpException e) {
             return error(e);
         }
+    }
+
+    // ── IAM policies ─────────────────────────────────────────────────────────
+
+    @GET
+    @Path("/{location}/keyRings/{keyRing}:getIamPolicy")
+    public Response getKeyRingIamPolicy(@PathParam("project") String project, @PathParam("location") String location,
+            @PathParam("keyRing") String keyRing) {
+        return getIamPolicy(keyRingName(project, location, keyRing));
+    }
+
+    @POST
+    @Path("/{location}/keyRings/{keyRing}:setIamPolicy")
+    public Response setKeyRingIamPolicy(@PathParam("project") String project, @PathParam("location") String location,
+            @PathParam("keyRing") String keyRing, Map<String, Object> body) {
+        return setIamPolicy(keyRingName(project, location, keyRing), body);
+    }
+
+    @POST
+    @Path("/{location}/keyRings/{keyRing}:testIamPermissions")
+    public Response testKeyRingIamPermissions(@PathParam("project") String project,
+            @PathParam("location") String location, @PathParam("keyRing") String keyRing, Map<String, Object> body) {
+        return testIamPermissions(keyRingName(project, location, keyRing), body);
+    }
+
+    @GET
+    @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:getIamPolicy")
+    public Response getCryptoKeyIamPolicy(@PathParam("project") String project, @PathParam("location") String location,
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey) {
+        return getIamPolicy(cryptoKeyName(project, location, keyRing, cryptoKey));
+    }
+
+    @POST
+    @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:setIamPolicy")
+    public Response setCryptoKeyIamPolicy(@PathParam("project") String project, @PathParam("location") String location,
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey, Map<String, Object> body) {
+        return setIamPolicy(cryptoKeyName(project, location, keyRing, cryptoKey), body);
+    }
+
+    @POST
+    @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:testIamPermissions")
+    public Response testCryptoKeyIamPermissions(@PathParam("project") String project,
+            @PathParam("location") String location, @PathParam("keyRing") String keyRing,
+            @PathParam("cryptoKey") String cryptoKey, Map<String, Object> body) {
+        return testIamPermissions(cryptoKeyName(project, location, keyRing, cryptoKey), body);
+    }
+
+    /** {@code options.requestedPolicyVersion} is not applied: the policy keeps the version it was set with. */
+    private Response getIamPolicy(String resource) {
+        try {
+            return Response.ok(service.getIamPolicy(resource)).build();
+        } catch (GcpException e) {
+            return error(e);
+        }
+    }
+
+    /** A request without {@code policy} sets the empty policy, as the default gRPC message does. */
+    private Response setIamPolicy(String resource, Map<String, Object> body) {
+        try {
+            return Response.ok(service.setIamPolicy(resource, IamPolicyCodec.fromJsonMap(policyField(body)))).build();
+        } catch (GcpException e) {
+            return error(e);
+        }
+    }
+
+    private Response testIamPermissions(String resource, Map<String, Object> body) {
+        try {
+            List<String> granted = service.testIamPermissions(resource, permissionsField(body));
+            return Response.ok(Map.of("permissions", granted)).build();
+        } catch (GcpException e) {
+            return error(e);
+        }
+    }
+
+    /**
+     * Checks the JSON types the shared policy codec casts to, so a malformed policy is INVALID_ARGUMENT
+     * rather than a server error. An int32 may arrive as a JSON number or, in proto3 JSON, a string.
+     */
+    private static Map<String, Object> policyField(Map<String, Object> body) {
+        Object value = body != null ? body.get("policy") : null;
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?> raw)) {
+            throw GcpException.invalidArgument("Invalid value at 'policy' (google.iam.v1.Policy): " + value);
+        }
+        Map<String, Object> policy = new LinkedHashMap<>();
+        raw.forEach((key, entry) -> policy.put(String.valueOf(key), entry));
+        if (policy.get("version") != null) {
+            policy.put("version", int32Field(policy.get("version"), "policy.version"));
+        } else {
+            policy.remove("version");
+        }
+        Object etag = policy.get("etag");
+        if (etag != null && !(etag instanceof String)) {
+            throw GcpException.invalidArgument("Invalid value at 'policy.etag' (TYPE_BYTES): " + etag);
+        }
+        Object bindings = policy.get("bindings");
+        if (bindings == null) {
+            policy.remove("bindings");
+        } else if (!(bindings instanceof List<?> list) || !list.stream().allMatch(Map.class::isInstance)) {
+            throw GcpException.invalidArgument("Invalid value at 'policy.bindings' (google.iam.v1.Binding): "
+                    + bindings);
+        }
+        return policy;
+    }
+
+    private static int int32Field(Object value, String field) {
+        try {
+            if (value instanceof Integer number) {
+                return number;
+            }
+            if (value instanceof String text) {
+                return Integer.parseInt(text);
+            }
+        } catch (NumberFormatException e) {
+            throw GcpException.invalidArgument("Invalid value at '" + field + "' (TYPE_INT32): " + value);
+        }
+        throw GcpException.invalidArgument("Invalid value at '" + field + "' (TYPE_INT32): " + value);
+    }
+
+    private static List<String> permissionsField(Map<String, Object> body) {
+        Object value = body != null ? body.get("permissions") : null;
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof List<?> list) || !list.stream().allMatch(String.class::isInstance)) {
+            throw GcpException.invalidArgument("Invalid value at 'permissions' (TYPE_STRING): " + value);
+        }
+        return list.stream().map(String.class::cast).toList();
     }
 
     // ── CryptoKeyVersions ────────────────────────────────────────────────────
