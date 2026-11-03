@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
@@ -16,6 +17,8 @@ import static org.hamcrest.Matchers.not;
 @QuarkusTest
 @TestProfile(ResourceManagerStrictRestIntegrationTest.StrictProjectsProfile.class)
 class ResourceManagerStrictRestIntegrationTest {
+
+    static final String CONFIGURED_ORGANIZATION = "424242424242";
 
     @Test
     void unknownProjectIsPermissionDeniedEverywhere() {
@@ -94,10 +97,53 @@ class ResourceManagerStrictRestIntegrationTest {
                 .then().statusCode(403);
     }
 
+    @Test
+    void onlyConfiguredOrganizationsExist() {
+        given().when().get("/v3/organizations/" + CONFIGURED_ORGANIZATION)
+                .then().statusCode(200)
+                .body("name", equalTo("organizations/" + CONFIGURED_ORGANIZATION))
+                .body("state", equalTo("ACTIVE"));
+        given().urlEncodingEnabled(false).contentType("application/json").body(Map.of())
+                .when().post("/v1/organizations:search")
+                .then().statusCode(200)
+                .body("organizations.name", contains("organizations/" + CONFIGURED_ORGANIZATION));
+
+        given().when().get("/v3/organizations/777")
+                .then().statusCode(403)
+                .body("error.status", equalTo("PERMISSION_DENIED"))
+                .body("error.message", equalTo("The caller does not have permission"));
+        given().when().get("/v1/organizations/777").then().statusCode(403);
+        given().urlEncodingEnabled(false).contentType("application/json").body("{}")
+                .when().post("/v3/organizations/777:getIamPolicy")
+                .then().statusCode(403);
+        given().contentType("application/json")
+                .body(Map.of("displayName", "Nowhere", "parent", "organizations/777"))
+                .when().post("/v3/folders")
+                .then().statusCode(403)
+                .body("error.status", equalTo("PERMISSION_DENIED"));
+        given().queryParam("parent", "organizations/777")
+                .when().get("/v3/folders")
+                .then().statusCode(403);
+    }
+
+    @Test
+    void foldersWorkUnderAConfiguredOrganization() {
+        String folder = given().contentType("application/json")
+                .body(Map.of("displayName", "Strict Folder", "parent", "organizations/" + CONFIGURED_ORGANIZATION))
+                .when().post("/v3/folders")
+                .then().statusCode(200)
+                .body("done", equalTo(true))
+                .extract().path("response.name");
+        given().when().get("/v3/" + folder)
+                .then().statusCode(200)
+                .body("parent", equalTo("organizations/" + CONFIGURED_ORGANIZATION));
+    }
+
     public static class StrictProjectsProfile implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
-            return Map.of("floci-gcp.projects.strict", "true");
+            return Map.of("floci-gcp.projects.strict", "true",
+                    "floci-gcp.projects.organizations", CONFIGURED_ORGANIZATION);
         }
     }
 }

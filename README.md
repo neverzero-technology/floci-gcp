@@ -217,7 +217,7 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 | Databases | Cloud SQL for PostgreSQL and MySQL |
 | Analytics | BigQuery |
 | Observability | Cloud Logging, Cloud Monitoring |
-| API management | Service Usage, Cloud Resource Manager v1 projects (create/get/list/update/delete, IAM policy mixins), Cloud Billing project billing info |
+| API management | Service Usage, Cloud Resource Manager v1 projects (create/get/list/update/delete, IAM policy mixins), v3 folders and v1/v3 organizations, Cloud Billing project billing info |
 
 <details>
 <summary>Detailed service notes</summary>
@@ -245,7 +245,7 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 | **Cloud Scheduler** | gRPC + REST JSON | Cron jobs with Pub/Sub, HTTP, and App Engine targets; `Pause`/`Resume`/`RunJob`; unix-cron + time zones; background tick fires due jobs (Pub/Sub publishes into the local backend) |
 | **Cloud Monitoring** | gRPC + REST JSON | Metric descriptors (create/get/list/delete), monitored resource descriptors, time series write (`CreateTimeSeries` with GCP validation rules) and read (`ListTimeSeries` with alignment/reduction subset and pagination) |
 | **Service Usage** | REST JSON | Enable/disable/list a project's services (`serviceusage.googleapis.com` v1) with done LROs; accept-and-succeed state store for Terraform `google_project_service`, Pulumi, and `gcloud services` |
-| **Resource Manager** | REST JSON | Cloud Resource Manager v1 projects: create (done LRO), get by ID or number, filtered list, update, delete/undelete, `getAncestry`, project IAM policy mixins; projects are registered on first use, or only when created with `FLOCI_GCP_PROJECTS_STRICT=true` |
+| **Resource Manager** | REST JSON | Cloud Resource Manager v1 projects: create (done LRO), get by ID or number, filtered list, update, delete/undelete, `getAncestry`, project IAM policy mixins; projects are registered on first use, or only when created with `FLOCI_GCP_PROJECTS_STRICT=true`. v3 folders (create, get, list, search, patch, move, delete/undelete, IAM policy) and v1/v3 organization get, search and IAM policy |
 | **Cloud Billing** | REST JSON | Project billing info get/update and billing-account `testIamPermissions` stub for Terraform `google_project` |
 | **Firebase Auth (Identity Platform)** | REST JSON | Identity Toolkit v1 wire-compatible with the official Auth emulator: email/password, anonymous and custom-token sign-in, unsigned emulator JWTs `firebase-admin` verifies, token refresh + revocation, admin user CRUD/list via `FIREBASE_AUTH_EMULATOR_HOST` |
 | **BigQuery** | REST JSON | Datasets and tables CRUD with schema normalization, schema-validated `tabledata.insertAll`/`tabledata.list`, query jobs (`jobs.query`, `jobs.insert`, `getQueryResults`) running GoogleSQL (joins, aggregation, window functions, CTEs, `UNNEST`, parameters, dry runs) on a DuckDB sidecar |
@@ -676,6 +676,7 @@ Versions are derived from Conventional Commits by [semantic-release](https://git
 IAM policies are stored without enforcement by default. For local permission tests,
 set `FLOCI_GCP_SERVICES_IAM_AUTHORIZATION_MODE=enforce` and use Floci-issued
 service-account tokens. This enforces Resource Manager v1 project metadata/policies,
+Resource Manager v3 folder and v1/v3 organization REST methods (no inheritance through them),
 Cloud Run v2 service and revision REST operations and service policies, Secret
 Manager REST and gRPC operations, Pub/Sub REST and gRPC operations, Cloud Scheduler job
 REST and gRPC operations, IAM service-account, key, credential, and custom-role

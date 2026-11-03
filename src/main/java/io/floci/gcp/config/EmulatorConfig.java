@@ -344,6 +344,12 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean strict();
+
+        /**
+         * Organization IDs that always exist, also in strict mode. Without strict mode any
+         * numeric organization ID is also registered on first use.
+         */
+        Optional<List<String>> organizations();
     }
 
     interface GkeServiceConfig {

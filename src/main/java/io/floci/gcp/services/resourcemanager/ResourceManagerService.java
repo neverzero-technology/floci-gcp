@@ -27,7 +27,9 @@ import java.util.regex.Pattern;
 /**
  * Cloud Resource Manager v1 projects surface, backed by the shared {@link ProjectRegistry}.
  * Projects used without being created are registered on first sight (unless strict mode is
- * on) and report a stable project number and createTime.
+ * on) and report a stable project number and createTime. Changes to a project's parent or
+ * lifecycle state run under the {@link ResourceManagerFolderService} hierarchy lock, so a folder
+ * cannot be deleted while a project is made active inside it.
  */
 @ApplicationScoped
 public class ResourceManagerService {
@@ -50,23 +52,27 @@ public class ResourceManagerService {
     private final IamService iamService;
     private final IamAuthorizationService iamAuthorization;
     private final ProjectRegistry projects;
+    private final ResourceManagerFolderService folders;
 
     @Inject
     public ResourceManagerService(ServiceRegistry serviceRegistry, EmulatorConfig config, IamService iamService,
-                                  IamAuthorizationService iamAuthorization, ProjectRegistry projects) {
+                                  IamAuthorizationService iamAuthorization, ProjectRegistry projects,
+                                  ResourceManagerFolderService folders) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.iamService = iamService;
         this.iamAuthorization = iamAuthorization;
         this.projects = projects;
+        this.folders = folders;
     }
 
-    ResourceManagerService(ProjectRegistry projects) {
+    ResourceManagerService(ProjectRegistry projects, ResourceManagerFolderService folders) {
         this.serviceRegistry = null;
         this.config = null;
         this.iamService = null;
         this.iamAuthorization = null;
         this.projects = projects;
+        this.folders = folders;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -74,7 +80,9 @@ public class ResourceManagerService {
                 .enabled(config.services().resourcemanager().enabled())
                 .protocol(ServiceProtocol.REST)
                 .resourceClasses(ResourceManagerController.class, ResourceManagerProjectsController.class,
-                        ResourceManagerIamController.class, ResourceManagerOperationsController.class)
+                        ResourceManagerIamController.class, ResourceManagerOperationsController.class,
+                        ResourceManagerFoldersController.class, ResourceManagerOrganizationsController.class,
+                        ResourceManagerOrganizationsV1Controller.class)
                 .api("cloudresourcemanager.googleapis.com", "Cloud Resource Manager API")
                 .build());
         iamService.registerPolicyResourceResolver("projects/*", this::requireProjectForPolicy);
@@ -107,7 +115,12 @@ public class ResourceManagerService {
             project.setParentType(parent.type());
             project.setParentId(parent.id());
         }
-        ProjectRecord created = projects.createOrAdopt(project);
+        ProjectRecord created = folders.withHierarchyLock(() -> {
+            if (parent != null) {
+                folders.requireActiveProjectParent(parent.type(), parent.id());
+            }
+            return projects.createOrAdopt(project);
+        });
         LOG.infof("create project id=%s number=%s", created.getProjectId(), created.getProjectNumber());
         return operation(created);
     }
@@ -118,9 +131,12 @@ public class ResourceManagerService {
         String name = validName(stringField(update, "name"));
         Map<String, String> labels = validLabels(update.get("labels"));
         Parent parent = parseParent(update.get("parent"));
-        ProjectRecord updated = projects.update(idOrNumber, project -> {
+        ProjectRecord updated = folders.withHierarchyLock(() -> projects.update(idOrNumber, project -> {
             if (!project.isActive()) {
                 throw GcpException.failedPrecondition("Project " + project.getProjectId() + " is not active.");
+            }
+            if (parent != null) {
+                folders.requireActiveProjectParent(parent.type(), parent.id());
             }
             project.setName(name);
             project.setLabels(labels);
@@ -128,7 +144,7 @@ public class ResourceManagerService {
                 project.setParentType(parent.type());
                 project.setParentId(parent.id());
             }
-        });
+        }));
         return toJson(updated);
     }
 
@@ -144,13 +160,14 @@ public class ResourceManagerService {
 
     public void undeleteProject(String idOrNumber) {
         requireProjectId(idOrNumber);
-        projects.update(idOrNumber, project -> {
+        folders.withHierarchyLock(() -> projects.update(idOrNumber, project -> {
             if (!ProjectRecord.DELETE_REQUESTED.equals(project.getLifecycleState())) {
                 throw GcpException.failedPrecondition("Project " + project.getProjectId()
                         + " is not in state DELETE_REQUESTED.");
             }
+            folders.requireActiveProjectParent(project.getParentType(), project.getParentId());
             project.setLifecycleState(ProjectRecord.ACTIVE);
-        });
+        }));
     }
 
     public Map<String, Object> getAncestry(String idOrNumber) {
@@ -158,7 +175,10 @@ public class ResourceManagerService {
         ProjectRecord project = projects.require(idOrNumber);
         List<Map<String, Object>> ancestors = new ArrayList<>();
         ancestors.add(Map.of("resourceId", resourceId("project", project.getProjectId())));
-        if (project.hasParent()) {
+        if (project.hasParent() && "folder".equals(project.getParentType())) {
+            folders.ancestorsOf(project.getParentId())
+                    .forEach(ancestor -> ancestors.add(Map.of("resourceId", ancestor)));
+        } else if (project.hasParent()) {
             ancestors.add(Map.of("resourceId", resourceId(project.getParentType(), project.getParentId())));
         }
         return Map.of("ancestor", ancestors);

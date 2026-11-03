@@ -441,6 +441,35 @@ setup() {
     assert_success
 }
 
+@test "OpenTofu: google_folder hierarchy created under the organization" {
+    platform=$(tofu output -raw folder_platform_name 2>/dev/null)
+    team=$(tofu output -raw folder_team_name 2>/dev/null)
+    [ -n "$platform" ] && [ -n "$team" ]
+    run gcp_curl "${FLOCI_ENDPOINT}/v3/${platform}"
+    assert_success
+    assert_output --partial '"parent":"organizations/123456789012"'
+    assert_output --partial '"state":"ACTIVE"'
+    run gcp_curl "${FLOCI_ENDPOINT}/v3/${team}"
+    assert_success
+    assert_output --partial "\"parent\":\"${platform}\""
+    assert_output --partial '"displayName":"floci compat team"'
+}
+
+@test "OpenTofu: google_folder_iam_member grant is in the folder policy" {
+    team=$(tofu output -raw folder_team_name 2>/dev/null)
+    result=$(gcp_curl -X POST -H 'Content-Type: application/json' -d '{}' "${FLOCI_ENDPOINT}/v3/${team}:getIamPolicy")
+    [[ "$result" == *'roles/resourcemanager.folderViewer'* ]]
+    [[ "$result" == *'group:platform@example.com'* ]]
+}
+
+@test "OpenTofu: google_folder plans no changes after apply" {
+    run tofu plan -detailed-exitcode -target=google_folder.platform -target=google_folder.team \
+        -target=google_folder_iam_member.team_viewer \
+        -var="endpoint=${FLOCI_ENDPOINT}" -var="project=${FLOCI_PROJECT}" \
+        -input=false -no-color
+    assert_success
+}
+
 # ── BigQuery Spot Checks ──────────────────────────────────────────────────────
 
 @test "OpenTofu: BigQuery dataset keeps its default expirations" {
