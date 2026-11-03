@@ -13,6 +13,38 @@ resource "google_storage_bucket" "compat" {
   }
 }
 
+# The fields a CMEK bucket with access logs sets: plan must show no changes after apply.
+resource "google_storage_bucket" "compat_cmek" {
+  name          = "floci-compat-cmek-bucket-tofu"
+  location      = upper(var.region)
+  storage_class = "NEARLINE"
+  force_destroy = true
+
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  encryption {
+    default_kms_key_name = google_kms_crypto_key.compat.id
+  }
+
+  logging {
+    log_bucket        = google_storage_bucket.compat.name
+    log_object_prefix = "floci-compat-cmek-bucket-tofu"
+  }
+
+  versioning {
+    enabled = true
+  }
+
+  retention_policy {
+    retention_period = 86400
+  }
+
+  labels = {
+    env = "compat-test"
+  }
+}
+
 resource "google_storage_bucket_object" "readme" {
   bucket       = google_storage_bucket.compat.name
   name         = "README.txt"

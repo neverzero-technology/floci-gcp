@@ -63,6 +63,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 import java.util.zip.CRC32C;
 
 @ApplicationScoped
@@ -72,6 +73,8 @@ public class GcsService {
     private static final int OBJECT_LOCK_COUNT = 256;
     private static final int COMPLETED_RESUMABLE_UPLOAD_HISTORY = 1024;
     private static final int UNIFORM_BUCKET_LEVEL_ACCESS_LOCK_DAYS = 90;
+    private static final Pattern CRYPTO_KEY_NAME =
+            Pattern.compile("projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+");
 
     private final StorageBackend<String, GcsBucket> bucketStore;
     private final StorageBackend<String, GcsObjectMeta> objectMetaStore;
@@ -299,6 +302,12 @@ public class GcsService {
                 if (body.containsKey("defaultEventBasedHold")) {
                     bucket.setDefaultEventBasedHold((Boolean) body.get("defaultEventBasedHold"));
                 }
+                if (body.containsKey("encryption")) {
+                    bucket.setEncryption(bucketEncryption(null, body.get("encryption")));
+                }
+                if (body.containsKey("logging")) {
+                    bucket.setLogging(patchedConfiguration("logging", null, body.get("logging")));
+                }
             }
             bucket.setSoftDeletePolicy(softDeletePolicy(
                     body != null && body.get("softDeletePolicy") instanceof Map<?, ?> requested
@@ -425,6 +434,12 @@ public class GcsService {
             Map<String, Object> updatedSoftDeletePolicy = patch.get("softDeletePolicy") instanceof Map<?, ?> requested
                     ? softDeletePolicy((Map<String, Object>) requested, bucket.getSoftDeletePolicy())
                     : null;
+            Map<String, Object> updatedEncryption = patch.containsKey("encryption")
+                    ? bucketEncryption(bucket.getEncryption(), patch.get("encryption"))
+                    : null;
+            Map<String, Object> updatedLogging = patch.containsKey("logging")
+                    ? patchedConfiguration("logging", bucket.getLogging(), patch.get("logging"))
+                    : null;
             if (patch.containsKey("labels") && resolvedFields) {
                 bucket.setLabels((Map<String, String>) patch.get("labels"));
             } else if (patch.containsKey(GcsGrpcMapper.LABEL_CHANGES) && resolvedFields) {
@@ -457,6 +472,12 @@ public class GcsService {
             }
             if (patch.containsKey("defaultEventBasedHold")) {
                 bucket.setDefaultEventBasedHold((Boolean) patch.get("defaultEventBasedHold"));
+            }
+            if (patch.containsKey("encryption")) {
+                bucket.setEncryption(updatedEncryption);
+            }
+            if (patch.containsKey("logging")) {
+                bucket.setLogging(updatedLogging);
             }
             long metageneration = Long.parseLong(bucket.getMetageneration());
             bucket.setMetageneration(Long.toString(metageneration + 1));
@@ -551,15 +572,64 @@ public class GcsService {
         for (Map.Entry<String, Object> entry : patch.entrySet()) {
             if (entry.getValue() == null) {
                 target.remove(entry.getKey());
-            } else if (entry.getValue() instanceof Map<?, ?> nestedPatch
-                    && target.get(entry.getKey()) instanceof Map<?, ?> nestedTarget) {
-                Map<String, Object> merged = mutableNestedMap(nestedTarget);
+            } else if (entry.getValue() instanceof Map<?, ?> nestedPatch) {
+                Map<String, Object> merged = target.get(entry.getKey()) instanceof Map<?, ?> nestedTarget
+                        ? mutableNestedMap(nestedTarget)
+                        : new LinkedHashMap<>();
                 mergeNestedMap(merged, mutableNestedMap(nestedPatch));
                 target.put(entry.getKey(), merged);
             } else {
                 target.put(entry.getKey(), entry.getValue());
             }
         }
+    }
+
+    /**
+     * A bucket sub-object under JSON API patch semantics: requested fields merge into the stored
+     * object, a null field is deleted, and a null object deletes the whole configuration.
+     * Insert applies the same rules to an empty object.
+     */
+    private static Map<String, Object> patchedConfiguration(String field, Map<String, Object> current,
+            Object requested) {
+        if (requested == null) {
+            return null;
+        }
+        if (!(requested instanceof Map<?, ?> fields)) {
+            throw GcpException.invalidArgument("Invalid value for " + field + ": expected an object.")
+                    .withReason("invalid");
+        }
+        Map<String, Object> merged = mutableNestedMap(current);
+        mergeNestedMap(merged, mutableNestedMap(fields));
+        return merged.isEmpty() ? null : merged;
+    }
+
+    /**
+     * The bucket's encryption configuration. The default key name is checked for the Cloud KMS
+     * CryptoKey name format only: floci does not require the key to exist in its own Cloud KMS
+     * or check its location against the bucket's, and objects are not encrypted with it.
+     */
+    private static Map<String, Object> bucketEncryption(Map<String, Object> current, Object requested) {
+        Map<String, Object> encryption = patchedConfiguration("encryption", current, requested);
+        if (encryption == null) {
+            return null;
+        }
+        if ("".equals(encryption.get("defaultKmsKeyName"))) {
+            encryption.remove("defaultKmsKeyName");
+        }
+        Object keyName = encryption.get("defaultKmsKeyName");
+        if (keyName != null && !(keyName instanceof String name && CRYPTO_KEY_NAME.matcher(name).matches())) {
+            throw GcpException.invalidArgument("Invalid encryption.defaultKmsKeyName: " + keyName
+                    + ". Use projects/PROJECT/locations/LOCATION/keyRings/KEY_RING/cryptoKeys/KEY.")
+                    .withReason("cloudKmsBadKey");
+        }
+        // Each enforcement config's effectiveTime is server-determined. floci records the
+        // restriction mode without enforcing it, so it reports no effective time.
+        for (Object value : encryption.values()) {
+            if (value instanceof Map<?, ?> enforcement) {
+                enforcement.remove("effectiveTime");
+            }
+        }
+        return encryption.isEmpty() ? null : encryption;
     }
 
     private static Map<String, Object> mutableNestedMap(Map<?, ?> source) {

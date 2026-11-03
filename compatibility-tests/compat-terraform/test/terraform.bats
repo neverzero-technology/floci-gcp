@@ -93,6 +93,22 @@ setup() {
     assert_output --partial '"name":"README.txt"'
 }
 
+@test "Terraform: GCS CMEK bucket keeps its default key and logging" {
+    run gcp_curl "${FLOCI_ENDPOINT}/storage/v1/b/floci-compat-cmek-bucket"
+    assert_success
+    assert_output --partial '"defaultKmsKeyName":"projects/'"${FLOCI_PROJECT}"'/locations/'"${FLOCI_REGION:-us-central1}"'/keyRings/floci-compat-keyring/cryptoKeys/floci-compat-key"'
+    assert_output --partial '"logBucket":"floci-compat-bucket"'
+    assert_output --partial '"logObjectPrefix":"floci-compat-cmek-bucket"'
+}
+
+@test "Terraform: GCS CMEK bucket plans no changes after apply" {
+    run terraform plan -detailed-exitcode \
+        -target=google_storage_bucket.compat_cmek \
+        -var="endpoint=${FLOCI_ENDPOINT}" -var="project=${FLOCI_PROJECT}" \
+        -input=false -no-color
+    assert_success
+}
+
 # ── IAM Spot Checks ───────────────────────────────────────────────────────────
 
 @test "Terraform: IAM service account created" {
