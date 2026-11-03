@@ -332,7 +332,14 @@ handles, or redirection. Unsupported RPCs return gRPC `UNIMPLEMENTED`.
 
 - `CreateBucket` (names validated against the GCS naming rules; a duplicate reports
   `reason: conflict`) (with `location`, `customPlacementConfig.dataLocations`, `storageClass`, `versioning`,
-  `lifecycle`, `cors`, `retentionPolicy`)
+  `lifecycle`, `cors`, `retentionPolicy`, `encryption`, `logging`)
+- `encryption` and `logging` are stored as bucket metadata and returned on every read. A JSON
+  `PATCH` merges into them, a field set to `null` is removed, and `"encryption": null` or
+  `"logging": null` removes the whole configuration. `encryption.defaultKmsKeyName` must have the
+  form `projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{key}`, otherwise
+  the request fails with `400` and `reason: cloudKmsBadKey`. The key does not have to exist in
+  floci-gcp's Cloud KMS, its location is not compared with the bucket's, and objects are not
+  encrypted with it. The log bucket is not checked and no access logs are written
 - Every bucket resource (REST and gRPC) reports `locationType`: `dual-region` for the predefined
   dual-regions `ASIA1`, `EUR4`, `EUR5`, `EUR7`, `EUR8` and `NAM4` or when `customPlacementConfig` names two data locations,
   `multi-region` for `US`, `EU` and `ASIA`, otherwise `region`. `GET /b/{bucket}/storageLayout`

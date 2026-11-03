@@ -38,6 +38,8 @@ public class GcsBucket {
     private Map<String, Object> softDeletePolicy;
     private Map<String, Object> iamConfiguration;
     private Boolean defaultEventBasedHold;
+    private Map<String, Object> encryption;
+    private Map<String, Object> logging;
 
     public String getKind() { return kind; }
     public void setKind(String kind) { this.kind = kind; }
@@ -144,4 +146,10 @@ public class GcsBucket {
 
     public Boolean getDefaultEventBasedHold() { return defaultEventBasedHold; }
     public void setDefaultEventBasedHold(Boolean defaultEventBasedHold) { this.defaultEventBasedHold = defaultEventBasedHold; }
+
+    public Map<String, Object> getEncryption() { return encryption; }
+    public void setEncryption(Map<String, Object> encryption) { this.encryption = encryption; }
+
+    public Map<String, Object> getLogging() { return logging; }
+    public void setLogging(Map<String, Object> logging) { this.logging = logging; }
 }

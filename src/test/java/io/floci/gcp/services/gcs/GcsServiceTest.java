@@ -213,6 +213,33 @@ class GcsServiceTest {
     }
 
     @Test
+    void encryptionAndLoggingSurvivePersistentStorageReload() {
+        Path bucketPath = tempDir.resolve("cmek-buckets.json");
+        TypeReference<Map<String, GcsBucket>> bucketType = new TypeReference<>() {};
+        HybridStorage<String, GcsBucket> bucketStore = new HybridStorage<>(
+                bucketPath, bucketType, TimeUnit.HOURS.toMillis(1));
+        HybridStorage<String, GcsBucket> restoredStore = new HybridStorage<>(
+                bucketPath, bucketType, TimeUnit.HOURS.toMillis(1));
+        try {
+            GcsService durableService = new GcsService(bucketStore, new InMemoryStorage<>(),
+                    new InMemoryStorage<>(), "test-project");
+            String key = "projects/p1/locations/us/keyRings/ring/cryptoKeys/key";
+            durableService.createBucket("cmek-bucket", "p1", BASE_URL, Map.of(
+                    "encryption", Map.of("defaultKmsKeyName", key),
+                    "logging", Map.of("logBucket", "logs", "logObjectPrefix", "cmek-bucket")));
+            bucketStore.checkpoint();
+
+            restoredStore.load();
+            GcsBucket restored = restoredStore.get("cmek-bucket").orElseThrow();
+            assertEquals(Map.of("defaultKmsKeyName", key), restored.getEncryption());
+            assertEquals(Map.of("logBucket", "logs", "logObjectPrefix", "cmek-bucket"), restored.getLogging());
+        } finally {
+            restoredStore.shutdown();
+            bucketStore.shutdown();
+        }
+    }
+
+    @Test
     void invalidPublicAccessPreventionDoesNotMutateBucket() {
         service.createBucket("my-bucket", "p1", BASE_URL, Map.of(
                 "iamConfiguration", Map.of("publicAccessPrevention", "enforced")));
