@@ -4,6 +4,7 @@ import com.google.cloud.secretmanager.v1.AccessSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.AccessSecretVersionResponse;
 import com.google.cloud.secretmanager.v1.AddSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.CreateSecretRequest;
+import com.google.cloud.secretmanager.v1.CustomerManagedEncryption;
 import com.google.cloud.secretmanager.v1.DeleteSecretRequest;
 import com.google.cloud.secretmanager.v1.DestroySecretVersionRequest;
 import com.google.cloud.secretmanager.v1.DisableSecretVersionRequest;
@@ -33,11 +34,14 @@ import io.floci.gcp.core.common.GcpGrpcController;
 import io.floci.gcp.core.common.GcpResourceNames;
 import io.floci.gcp.core.common.PageToken;
 import io.floci.gcp.services.secretmanager.model.StoredSecret;
+import io.floci.gcp.services.secretmanager.model.StoredSecretReplica;
 import io.floci.gcp.services.secretmanager.model.StoredSecretVersion;
 import io.grpc.stub.StreamObserver;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 
 public class SecretManagerController extends SecretManagerServiceGrpc.SecretManagerServiceImplBase {
@@ -58,8 +62,7 @@ public class SecretManagerController extends SecretManagerServiceGrpc.SecretMana
         LOG.infof("createSecret parent=%s secretId=%s", request.getParent(), request.getSecretId());
         try {
             String project = parentProject(request.getParent());
-            String replicationType = request.getSecret().getReplication().hasUserManaged() ? "user_managed" : "automatic";
-            StoredSecret stored = service.createSecret(project, request.getSecretId(), replicationType);
+            StoredSecret stored = service.createSecret(project, request.getSecretId(), fromProto(request.getSecret()));
             responseObserver.onNext(toProto(stored));
             responseObserver.onCompleted();
         } catch (Exception e) {
@@ -108,7 +111,8 @@ public class SecretManagerController extends SecretManagerServiceGrpc.SecretMana
     public void updateSecret(UpdateSecretRequest request, StreamObserver<Secret> responseObserver) {
         LOG.debugf("updateSecret name=%s", request.getSecret().getName());
         try {
-            StoredSecret stored = service.updateSecret(secretName(request.getSecret().getName()));
+            StoredSecret stored = service.updateSecret(secretName(request.getSecret().getName()),
+                    fromProto(request.getSecret()), request.getUpdateMask().getPathsList());
             responseObserver.onNext(toProto(stored));
             responseObserver.onCompleted();
         } catch (Exception e) {
@@ -286,18 +290,64 @@ public class SecretManagerController extends SecretManagerServiceGrpc.SecretMana
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
+    private static StoredSecret fromProto(Secret secret) {
+        StoredSecret requested = new StoredSecret();
+        if (secret.hasReplication()) {
+            Replication replication = secret.getReplication();
+            if (replication.hasUserManaged()) {
+                requested.setReplicationType(StoredSecret.USER_MANAGED);
+                List<StoredSecretReplica> replicas = new ArrayList<>();
+                for (Replication.UserManaged.Replica replica : replication.getUserManaged().getReplicasList()) {
+                    replicas.add(new StoredSecretReplica(replica.getLocation(),
+                            replica.hasCustomerManagedEncryption()
+                                    ? replica.getCustomerManagedEncryption().getKmsKeyName()
+                                    : null));
+                }
+                requested.setReplicas(replicas);
+            } else {
+                requested.setReplicationType(StoredSecret.AUTOMATIC);
+                if (replication.getAutomatic().hasCustomerManagedEncryption()) {
+                    requested.setAutomaticKmsKeyName(
+                            replication.getAutomatic().getCustomerManagedEncryption().getKmsKeyName());
+                }
+            }
+        }
+        requested.setLabels(new LinkedHashMap<>(secret.getLabelsMap()));
+        requested.setAnnotations(new LinkedHashMap<>(secret.getAnnotationsMap()));
+        return requested;
+    }
+
     private static Secret toProto(StoredSecret stored) {
         Secret.Builder builder = Secret.newBuilder()
                 .setName(stored.getName())
                 .setCreateTime(toTimestamp(stored.getCreateTime()));
-        if ("user_managed".equals(stored.getReplicationType())) {
-            builder.setReplication(Replication.newBuilder()
-                    .setUserManaged(Replication.UserManaged.getDefaultInstance())
-                    .build());
+        if (stored.usesUserManagedReplication()) {
+            Replication.UserManaged.Builder userManaged = Replication.UserManaged.newBuilder();
+            if (stored.getReplicas() != null) {
+                for (StoredSecretReplica replica : stored.getReplicas()) {
+                    Replication.UserManaged.Replica.Builder replicaProto = Replication.UserManaged.Replica.newBuilder()
+                            .setLocation(replica.getLocation());
+                    if (replica.getKmsKeyName() != null) {
+                        replicaProto.setCustomerManagedEncryption(CustomerManagedEncryption.newBuilder()
+                                .setKmsKeyName(replica.getKmsKeyName()));
+                    }
+                    userManaged.addReplicas(replicaProto);
+                }
+            }
+            builder.setReplication(Replication.newBuilder().setUserManaged(userManaged));
         } else {
-            builder.setReplication(Replication.newBuilder()
-                    .setAutomatic(Replication.Automatic.getDefaultInstance())
-                    .build());
+            Replication.Automatic.Builder automatic = Replication.Automatic.newBuilder();
+            if (stored.getAutomaticKmsKeyName() != null) {
+                automatic.setCustomerManagedEncryption(CustomerManagedEncryption.newBuilder()
+                        .setKmsKeyName(stored.getAutomaticKmsKeyName()));
+            }
+            builder.setReplication(Replication.newBuilder().setAutomatic(automatic));
+        }
+        if (stored.getLabels() != null) {
+            builder.putAllLabels(stored.getLabels());
+        }
+        if (stored.getAnnotations() != null) {
+            builder.putAllAnnotations(stored.getAnnotations());
         }
         return builder.build();
     }

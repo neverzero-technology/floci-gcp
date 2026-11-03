@@ -11,9 +11,15 @@ import java.util.UUID;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.nullValue;
 
 @QuarkusTest
 class SecretManagerRestIntegrationTest {
+
+    private static final String KEY_EUROPE_WEST1 =
+            "projects/phx-example-security/locations/europe-west1/keyRings/phoenix/cryptoKeys/secrets";
+    private static final String KEY_GLOBAL =
+            "projects/phx-example-security/locations/global/keyRings/phoenix/cryptoKeys/secrets";
 
     @Test
     void iamPolicyUsesGetForReadAndPostForWrites() {
@@ -83,6 +89,185 @@ class SecretManagerRestIntegrationTest {
                 .then().statusCode(200);
         given().urlEncodingEnabled(false).when().get(base + ":getIamPolicy")
                 .then().statusCode(200).body("bindings", empty());
+    }
+
+    @Test
+    void userManagedReplicasWithCustomerManagedEncryptionRoundTrip() {
+        String project = "secret-replication-rest-it";
+        given().contentType("application/json")
+                .body("""
+                        {"replication":{"automatic":null,"userManaged":{"replicas":[
+                          {"location":"europe-west1","customerManagedEncryption":{"kmsKeyName":"%s"}},
+                          {"location":"europe-west2"}]}},
+                         "labels":{"phoenix-team":"team-example","goog-terraform-provisioned":"true"}}
+                        """.formatted(KEY_EUROPE_WEST1))
+                .queryParam("secretId", "replicated")
+                .when().post("/v1/projects/" + project + "/secrets")
+                .then().statusCode(200)
+                .body("replication.userManaged.replicas.size()", equalTo(2))
+                .body("replication.userManaged.replicas[0].customerManagedEncryption.kmsKeyName",
+                        equalTo(KEY_EUROPE_WEST1));
+
+        given().when().get("/v1/projects/" + project + "/secrets/replicated")
+                .then().statusCode(200)
+                .body("replication.automatic", nullValue())
+                .body("replication.userManaged.replicas[0].location", equalTo("europe-west1"))
+                .body("replication.userManaged.replicas[0].customerManagedEncryption.kmsKeyName",
+                        equalTo(KEY_EUROPE_WEST1))
+                .body("replication.userManaged.replicas[1].location", equalTo("europe-west2"))
+                .body("replication.userManaged.replicas[1].customerManagedEncryption", nullValue())
+                .body("labels.'phoenix-team'", equalTo("team-example"))
+                .body("labels.'goog-terraform-provisioned'", equalTo("true"))
+                .body("annotations", nullValue());
+
+        given().when().get("/v1/projects/" + project + "/secrets")
+                .then().statusCode(200)
+                .body("secrets[0].replication.userManaged.replicas[1].location", equalTo("europe-west2"));
+    }
+
+    @Test
+    void automaticReplicationWithCustomerManagedEncryptionRoundTrips() {
+        String project = "secret-automatic-cmek-rest-it";
+        given().contentType("application/json")
+                .body("""
+                        {"replication":{"automatic":{"customerManagedEncryption":{"kmsKeyName":"%s"}}},
+                         "annotations":{"phoenix.neverzero.io/request":"req-1"}}
+                        """.formatted(KEY_GLOBAL))
+                .queryParam("secretId", "automatic-cmek")
+                .when().post("/v1/projects/" + project + "/secrets")
+                .then().statusCode(200);
+
+        given().when().get("/v1/projects/" + project + "/secrets/automatic-cmek")
+                .then().statusCode(200)
+                .body("replication.userManaged", nullValue())
+                .body("replication.automatic.customerManagedEncryption.kmsKeyName", equalTo(KEY_GLOBAL))
+                .body("annotations.'phoenix.neverzero.io/request'", equalTo("req-1"))
+                .body("labels", nullValue());
+    }
+
+    @Test
+    void protoFieldNamesAreAcceptedForReplication() {
+        String project = "secret-proto-names-rest-it";
+        given().contentType("application/json")
+                .body("""
+                        {"replication":{"user_managed":{"replicas":[
+                          {"location":"europe-west1","customer_managed_encryption":{"kms_key_name":"%s"}}]}}}
+                        """.formatted(KEY_EUROPE_WEST1))
+                .queryParam("secretId", "proto-names")
+                .when().post("/v1/projects/" + project + "/secrets")
+                .then().statusCode(200)
+                .body("replication.userManaged.replicas[0].customerManagedEncryption.kmsKeyName",
+                        equalTo(KEY_EUROPE_WEST1));
+    }
+
+    @Test
+    void labelsAndAnnotationsPatchThroughUpdateMask() {
+        String project = "secret-patch-rest-it";
+        String base = "/v1/projects/" + project + "/secrets/patched";
+        given().contentType("application/json")
+                .body("""
+                        {"replication":{"userManaged":{"replicas":[{"location":"europe-west1",
+                          "customerManagedEncryption":{"kmsKeyName":"%s"}}]}},
+                         "labels":{"phoenix-request":"req-1","phoenix-team":"team-example"},
+                         "annotations":{"owner":"platform"}}
+                        """.formatted(KEY_EUROPE_WEST1))
+                .queryParam("secretId", "patched")
+                .when().post("/v1/projects/" + project + "/secrets")
+                .then().statusCode(200);
+
+        given().contentType("application/json")
+                .body("""
+                        {"replication":{"userManaged":{"replicas":[{"location":"europe-west1",
+                          "customerManagedEncryption":{"kmsKeyName":"%s"}}]}},
+                         "labels":{"phoenix-request":"req-2","phoenix-team":"team-example"},
+                         "annotations":{"owner":"not-in-mask"}}
+                        """.formatted(KEY_EUROPE_WEST1))
+                .queryParam("updateMask", "labels")
+                .when().patch(base)
+                .then().statusCode(200)
+                .body("labels.'phoenix-request'", equalTo("req-2"))
+                .body("annotations.owner", equalTo("platform"));
+
+        given().contentType("application/json")
+                .body("{\"annotations\":{\"owner\":\"security\"}}")
+                .queryParam("updateMask", "annotations")
+                .when().patch(base)
+                .then().statusCode(200)
+                .body("annotations.owner", equalTo("security"))
+                .body("labels.'phoenix-request'", equalTo("req-2"));
+
+        given().when().get(base)
+                .then().statusCode(200)
+                .body("labels.'phoenix-request'", equalTo("req-2"))
+                .body("annotations.owner", equalTo("security"))
+                .body("replication.userManaged.replicas[0].customerManagedEncryption.kmsKeyName",
+                        equalTo(KEY_EUROPE_WEST1));
+
+        given().contentType("application/json").body("{}")
+                .queryParam("updateMask", "labels,annotations")
+                .when().patch(base)
+                .then().statusCode(200)
+                .body("labels", nullValue())
+                .body("annotations", nullValue());
+    }
+
+    @Test
+    void changingReplicationIsInvalidArgumentAndUnchangedReplicationIsAccepted() {
+        String project = "secret-immutable-rest-it";
+        String base = "/v1/projects/" + project + "/secrets/immutable";
+        String replication = """
+                {"userManaged":{"replicas":[{"location":"europe-west1",
+                  "customerManagedEncryption":{"kmsKeyName":"%s"}}]}}""".formatted(KEY_EUROPE_WEST1);
+        given().contentType("application/json")
+                .body("{\"replication\":" + replication + ",\"labels\":{\"team\":\"a\"}}")
+                .queryParam("secretId", "immutable")
+                .when().post("/v1/projects/" + project + "/secrets")
+                .then().statusCode(200);
+
+        given().contentType("application/json")
+                .body("{\"replication\":{\"automatic\":{}},\"labels\":{\"team\":\"b\"}}")
+                .queryParam("updateMask", "replication,labels")
+                .when().patch(base)
+                .then().statusCode(400)
+                .body("error.code", equalTo(400))
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+
+        given().when().get(base)
+                .then().statusCode(200)
+                .body("labels.team", equalTo("a"))
+                .body("replication.userManaged.replicas[0].location", equalTo("europe-west1"));
+
+        given().contentType("application/json")
+                .body("{\"replication\":" + replication + ",\"labels\":{\"team\":\"b\"}}")
+                .queryParam("updateMask", "replication,labels")
+                .when().patch(base)
+                .then().statusCode(200)
+                .body("labels.team", equalTo("b"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{\"replication\":{\"userManaged\":{\"replicas\":[]}}}",
+            "{\"replication\":{\"userManaged\":{}}}",
+            "{\"replication\":{\"userManaged\":{\"replicas\":[null]}}}",
+            "{\"replication\":{\"userManaged\":{\"replicas\":[{\"customerManagedEncryption\":{}}]}}}",
+            "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"europe-west1\",\"customerManagedEncryption\":{}}]}}}",
+            "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"europe-west1\",\"customerManagedEncryption\":{\"kmsKeyName\":\"projects/p/keyRings/r/cryptoKeys/k\"}}]}}}",
+            "{\"replication\":{\"automatic\":{\"customerManagedEncryption\":{\"kmsKeyName\":\"global/k\"}}}}",
+            "{\"replication\":{\"automatic\":{},\"userManaged\":{\"replicas\":[{\"location\":\"europe-west1\"}]}}}",
+            "{\"replication\":{\"automatic\":{}},\"labels\":{\"team\":1}}"})
+    void invalidReplicationOrLabelsDoNotCreateSecret(String body) {
+        String project = "secret-invalid-rest-it-" + UUID.randomUUID();
+        given().contentType("application/json")
+                .body(body)
+                .queryParam("secretId", "invalid")
+                .when().post("/v1/projects/" + project + "/secrets")
+                .then().statusCode(400)
+                .body("error.code", equalTo(400))
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+
+        given().when().get("/v1/projects/" + project + "/secrets/invalid")
+                .then().statusCode(404);
     }
 
     @ParameterizedTest

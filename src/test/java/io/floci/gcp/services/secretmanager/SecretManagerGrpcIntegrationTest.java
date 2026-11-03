@@ -4,6 +4,7 @@ import com.google.cloud.secretmanager.v1.AccessSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.AccessSecretVersionResponse;
 import com.google.cloud.secretmanager.v1.AddSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.CreateSecretRequest;
+import com.google.cloud.secretmanager.v1.CustomerManagedEncryption;
 import com.google.cloud.secretmanager.v1.DestroySecretVersionRequest;
 import com.google.cloud.secretmanager.v1.DisableSecretVersionRequest;
 import com.google.cloud.secretmanager.v1.GetSecretRequest;
@@ -15,8 +16,10 @@ import com.google.cloud.secretmanager.v1.Secret;
 import com.google.cloud.secretmanager.v1.SecretManagerServiceGrpc;
 import com.google.cloud.secretmanager.v1.SecretPayload;
 import com.google.cloud.secretmanager.v1.SecretVersion;
+import com.google.cloud.secretmanager.v1.UpdateSecretRequest;
 import com.google.iam.v1.GetIamPolicyRequest;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.FieldMask;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -32,6 +35,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -41,6 +45,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class SecretManagerGrpcIntegrationTest {
+
+    private static final String KEY_EUROPE_WEST1 =
+            "projects/phx-example-security/locations/europe-west1/keyRings/phoenix/cryptoKeys/secrets";
+    private static final String KEY_GLOBAL =
+            "projects/phx-example-security/locations/global/keyRings/phoenix/cryptoKeys/secrets";
 
     private static final String REGIONAL_MESSAGE =
             "Regional secrets (projects/*/locations/*) are not supported by the floci Secret Manager emulator";
@@ -215,6 +224,119 @@ class SecretManagerGrpcIntegrationTest {
                         .setName(secretName + "/versions/2").build()));
         assertEquals("Secret Version [" + secretName + "/versions/2] is in DESTROYED state.",
                 destroyed.getStatus().getDescription());
+    }
+
+    @Test
+    void userManagedReplicasLabelsAndAnnotationsRoundTrip() {
+        String project = "grpc-replication-project";
+        String secretName = "projects/" + project + "/secrets/replicated";
+        Replication replication = Replication.newBuilder()
+                .setUserManaged(Replication.UserManaged.newBuilder()
+                        .addReplicas(Replication.UserManaged.Replica.newBuilder()
+                                .setLocation("europe-west1")
+                                .setCustomerManagedEncryption(CustomerManagedEncryption.newBuilder()
+                                        .setKmsKeyName(KEY_EUROPE_WEST1)))
+                        .addReplicas(Replication.UserManaged.Replica.newBuilder()
+                                .setLocation("europe-west2")))
+                .build();
+
+        stub.createSecret(CreateSecretRequest.newBuilder()
+                .setParent("projects/" + project)
+                .setSecretId("replicated")
+                .setSecret(Secret.newBuilder()
+                        .setReplication(replication)
+                        .putLabels("phoenix-team", "team-example")
+                        .putAnnotations("owner", "platform"))
+                .build());
+
+        Secret fetched = stub.getSecret(GetSecretRequest.newBuilder().setName(secretName).build());
+        assertEquals(replication, fetched.getReplication());
+        assertEquals(Map.of("phoenix-team", "team-example"), fetched.getLabelsMap());
+        assertEquals(Map.of("owner", "platform"), fetched.getAnnotationsMap());
+    }
+
+    @Test
+    void automaticReplicationKeepsCustomerManagedEncryption() {
+        String project = "grpc-automatic-cmek-project";
+        Replication replication = Replication.newBuilder()
+                .setAutomatic(Replication.Automatic.newBuilder()
+                        .setCustomerManagedEncryption(CustomerManagedEncryption.newBuilder()
+                                .setKmsKeyName(KEY_GLOBAL)))
+                .build();
+
+        stub.createSecret(CreateSecretRequest.newBuilder()
+                .setParent("projects/" + project)
+                .setSecretId("automatic-cmek")
+                .setSecret(Secret.newBuilder().setReplication(replication))
+                .build());
+
+        Secret fetched = stub.getSecret(GetSecretRequest.newBuilder()
+                .setName("projects/" + project + "/secrets/automatic-cmek").build());
+        assertEquals(replication, fetched.getReplication());
+    }
+
+    @Test
+    void invalidReplicationIsInvalidArgumentAndStoresNothing() {
+        String project = "grpc-invalid-replication-project";
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> stub.createSecret(CreateSecretRequest.newBuilder()
+                .setParent("projects/" + project)
+                .setSecretId("empty-replicas")
+                .setSecret(Secret.newBuilder().setReplication(Replication.newBuilder()
+                        .setUserManaged(Replication.UserManaged.getDefaultInstance())))
+                .build()));
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> stub.createSecret(CreateSecretRequest.newBuilder()
+                .setParent("projects/" + project)
+                .setSecretId("bad-key")
+                .setSecret(Secret.newBuilder().setReplication(Replication.newBuilder()
+                        .setAutomatic(Replication.Automatic.newBuilder()
+                                .setCustomerManagedEncryption(CustomerManagedEncryption.newBuilder()
+                                        .setKmsKeyName("projects/p/cryptoKeys/k")))))
+                .build()));
+
+        assertEquals(0, stub.listSecrets(ListSecretsRequest.newBuilder()
+                .setParent("projects/" + project).build()).getSecretsCount());
+    }
+
+    @Test
+    void updateSecretAppliesUpdateMaskAndRejectsReplicationChange() {
+        String project = "grpc-update-project";
+        String secretName = "projects/" + project + "/secrets/patched";
+        stub.createSecret(CreateSecretRequest.newBuilder()
+                .setParent("projects/" + project)
+                .setSecretId("patched")
+                .setSecret(Secret.newBuilder()
+                        .setReplication(Replication.newBuilder()
+                                .setAutomatic(Replication.Automatic.getDefaultInstance()))
+                        .putLabels("team", "a")
+                        .putAnnotations("owner", "platform"))
+                .build());
+
+        Secret updated = stub.updateSecret(UpdateSecretRequest.newBuilder()
+                .setSecret(Secret.newBuilder()
+                        .setName(secretName)
+                        .putLabels("team", "b")
+                        .putAnnotations("owner", "not-in-mask"))
+                .setUpdateMask(FieldMask.newBuilder().addPaths("labels"))
+                .build());
+        assertEquals(Map.of("team", "b"), updated.getLabelsMap());
+        assertEquals(Map.of("owner", "platform"), updated.getAnnotationsMap());
+
+        StatusRuntimeException ex = assertStatus(Status.Code.INVALID_ARGUMENT,
+                () -> stub.updateSecret(UpdateSecretRequest.newBuilder()
+                        .setSecret(Secret.newBuilder()
+                                .setName(secretName)
+                                .setReplication(Replication.newBuilder()
+                                        .setUserManaged(Replication.UserManaged.newBuilder()
+                                                .addReplicas(Replication.UserManaged.Replica.newBuilder()
+                                                        .setLocation("europe-west1"))))
+                                .putLabels("team", "c"))
+                        .setUpdateMask(FieldMask.newBuilder().addPaths("replication").addPaths("labels"))
+                        .build()));
+        assertTrue(ex.getStatus().getDescription().contains("immutable"));
+
+        Secret fetched = stub.getSecret(GetSecretRequest.newBuilder().setName(secretName).build());
+        assertTrue(fetched.getReplication().hasAutomatic());
+        assertEquals(Map.of("team", "b"), fetched.getLabelsMap());
     }
 
     private static CreateSecretRequest createRequest(String parent, String secretId) {

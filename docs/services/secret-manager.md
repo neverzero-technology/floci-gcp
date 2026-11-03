@@ -217,6 +217,29 @@ requests after restart or recreates the same secret name. Policies are stored
 but not enforced: a caller that would be denied by IAM in GCP can still access
 emulator resources.
 
+## Secret Metadata
+
+`CreateSecret`, `GetSecret` and `ListSecrets` keep and return these `Secret`
+fields over gRPC and REST:
+
+- `replication.automatic`, with optional `customerManagedEncryption.kmsKeyName`
+- `replication.userManaged.replicas[]`: `location` and optional
+  `customerManagedEncryption.kmsKeyName` for each replica
+- `labels` and `annotations`
+
+A user-managed policy needs at least one replica, and each replica needs a
+location. A `kmsKeyName` must have the documented format
+`projects/*/locations/*/keyRings/*/cryptoKeys/*`; the key does not have to exist
+in the emulator, and the rule that a key sits in its replica's location (or in
+`global` for automatic replication) is not checked. A request that breaks these
+rules returns `INVALID_ARGUMENT` and stores nothing. Payloads are not
+encrypted with the key.
+
+`UpdateSecret` applies the `labels` and `annotations` paths of the update mask.
+`replication` is immutable: a mask that names it with a different policy returns
+`INVALID_ARGUMENT` and changes nothing, while an unchanged policy is accepted.
+An empty mask changes nothing. Other mask paths are ignored.
+
 ## Supported Operations
 
 - `CreateSecret`
@@ -240,6 +263,9 @@ emulator resources.
 - Regional secrets (`projects/{project}/locations/{location}/secrets/...`) are not
   supported. gRPC calls that use a regional parent or name return `UNIMPLEMENTED`,
   and the REST API only serves the global `/v1/projects/{project}/secrets/...` paths.
+- `topics`, `rotation`, `versionAliases`, `expireTime`, `ttl`,
+  `versionDestroyTtl`, `tags`, `secretType`, `etag` and the regional
+  `customerManagedEncryption` field are not stored or returned.
 - gRPC parents and names must match `projects/{project}`,
   `projects/{project}/secrets/{secret}` or
   `projects/{project}/secrets/{secret}/versions/{version}`; anything else returns
