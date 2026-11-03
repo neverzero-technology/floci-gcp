@@ -393,6 +393,28 @@ setup() {
     [[ "$result" == *'"state":"ENABLED"'* ]]
 }
 
+@test "OpenTofu: KMS crypto key IAM policy holds the encrypter grant" {
+    result=$(gcp_curl "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/locations/${FLOCI_REGION:-us-central1}/keyRings/floci-compat-keyring-tofu/cryptoKeys/floci-compat-key-tofu:getIamPolicy")
+    [[ "$result" == *'roles/cloudkms.cryptoKeyEncrypterDecrypter'* ]]
+    [[ "$result" == *'floci-compat-sa-tofu@'* ]]
+    [[ "$result" != *'roles/cloudkms.viewer'* ]]
+}
+
+@test "OpenTofu: KMS key ring IAM policy holds the viewer grant" {
+    result=$(gcp_curl "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/locations/${FLOCI_REGION:-us-central1}/keyRings/floci-compat-keyring-tofu:getIamPolicy")
+    [[ "$result" == *'roles/cloudkms.viewer'* ]]
+    [[ "$result" == *'floci-compat-sa-tofu@'* ]]
+}
+
+@test "OpenTofu: KMS IAM members plan no changes after apply" {
+    run tofu plan -detailed-exitcode \
+        -target=google_kms_crypto_key_iam_member.encrypter \
+        -target=google_kms_key_ring_iam_member.viewer \
+        -var="endpoint=${FLOCI_ENDPOINT}" -var="project=${FLOCI_PROJECT}" \
+        -input=false -no-color
+    assert_success
+}
+
 # ── Service Usage Spot Checks ─────────────────────────────────────────────────
 
 @test "OpenTofu: Service Usage project service enabled" {

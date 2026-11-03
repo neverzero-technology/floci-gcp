@@ -1,9 +1,15 @@
 package io.floci.gcp.test;
 
+import com.google.api.gax.rpc.AbortedException;
+import com.google.api.gax.rpc.NotFoundException;
 import com.google.cloud.kms.v1.*;
 import com.google.cloud.location.GetLocationRequest;
 import com.google.cloud.location.ListLocationsRequest;
 import com.google.cloud.location.Location;
+import com.google.iam.v1.Binding;
+import com.google.iam.v1.GetIamPolicyRequest;
+import com.google.iam.v1.Policy;
+import com.google.iam.v1.SetIamPolicyRequest;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.FieldMask;
@@ -336,6 +342,33 @@ class KmsTest {
         verifier.initVerify(pair.getPublic());
         verifier.update(data);
         assertThat(verifier.verify(signed.getSignature().toByteArray())).isTrue();
+    }
+
+    @Test
+    @Order(13)
+    void cryptoKeyIamPolicyRoundTripsWithEtagChecks() {
+        CryptoKey key = client.createCryptoKey(keyRing(), TestFixtures.uniqueName("iam"),
+                CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ENCRYPT_DECRYPT).build());
+        Policy empty = client.getIamPolicy(GetIamPolicyRequest.newBuilder().setResource(key.getName()).build());
+        assertThat(empty.getBindingsList()).isEmpty();
+
+        Binding binding = Binding.newBuilder()
+                .setRole("roles/cloudkms.cryptoKeyEncrypterDecrypter")
+                .addMembers("serviceAccount:compat@" + PROJECT_ID + ".iam.gserviceaccount.com")
+                .build();
+        Policy set = client.setIamPolicy(SetIamPolicyRequest.newBuilder().setResource(key.getName())
+                .setPolicy(empty.toBuilder().addBindings(binding)).build());
+        assertThat(set.getEtag()).isNotEqualTo(empty.getEtag());
+        assertThat(client.getIamPolicy(GetIamPolicyRequest.newBuilder().setResource(key.getName()).build())
+                .getBindingsList()).containsExactly(binding);
+
+        Throwable stale = catchThrowable(() -> client.setIamPolicy(SetIamPolicyRequest.newBuilder()
+                .setResource(key.getName()).setPolicy(empty).build()));
+        assertThat(stale).isInstanceOf(AbortedException.class);
+
+        Throwable missing = catchThrowable(() -> client.getIamPolicy(GetIamPolicyRequest.newBuilder()
+                .setResource(keyRing() + "/cryptoKeys/" + TestFixtures.uniqueName("missing")).build()));
+        assertThat(missing).isInstanceOf(NotFoundException.class);
     }
 
     /** Client-side wrapping for the {@code *_AES_256} import methods, as the GCP import docs describe it. */

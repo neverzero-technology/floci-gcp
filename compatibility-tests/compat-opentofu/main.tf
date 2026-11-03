@@ -181,6 +181,20 @@ resource "google_kms_crypto_key" "compat" {
   }
 }
 
+# A service agent granted use of a key, as CMEK set-ups do, and a key ring
+# viewer: both go through the KMS getIamPolicy → merge → setIamPolicy flow.
+resource "google_kms_crypto_key_iam_member" "encrypter" {
+  crypto_key_id = google_kms_crypto_key.compat.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${google_service_account.compat.email}"
+}
+
+resource "google_kms_key_ring_iam_member" "viewer" {
+  key_ring_id = google_kms_key_ring.compat.id
+  role        = "roles/cloudkms.viewer"
+  member      = "serviceAccount:${google_service_account.compat.email}"
+}
+
 # ── Pub/Sub ───────────────────────────────────────────────────────────────────
 resource "google_pubsub_topic" "compat" {
   name = "floci-compat-topic-tofu"

@@ -15,6 +15,8 @@ import io.floci.gcp.services.cloudkms.model.StoredCryptoKey;
 import io.floci.gcp.services.cloudkms.model.StoredCryptoKeyVersion;
 import io.floci.gcp.services.cloudkms.model.StoredImportJob;
 import io.floci.gcp.services.cloudkms.model.StoredKeyRing;
+import io.floci.gcp.services.iam.IamService;
+import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
@@ -62,12 +64,15 @@ public class CloudKmsService {
     private final EmulatorConfig config;
     private final GrpcServerManager grpcServerManager;
     private final LocationCatalog locations;
+    private final IamService iamService;
 
     @Inject
     public CloudKmsService(ServiceRegistry serviceRegistry, EmulatorConfig config,
-            StorageFactory storageFactory, GrpcServerManager grpcServerManager, LocationCatalog locations) {
+            StorageFactory storageFactory, GrpcServerManager grpcServerManager, LocationCatalog locations,
+            IamService iamService) {
         this.serviceRegistry = serviceRegistry;
         this.locations = locations;
+        this.iamService = iamService;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
         this.keyRingStore = storageFactory.createGlobal("cloudkms-keyrings", "cloudkms-keyrings.json",
@@ -92,6 +97,7 @@ public class CloudKmsService {
         this.config = null;
         this.grpcServerManager = null;
         this.locations = LocationCatalog.lenient();
+        this.iamService = null;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -104,6 +110,11 @@ public class CloudKmsService {
                         CloudKmsHttpController.class)
                 .build());
         grpcServerManager.bind(new CloudKmsController(this));
+        // The shared IAM store (REST here, gRPC through the google.iam.v1.IAMPolicy mixin) only keeps
+        // policies for key rings and crypto keys that exist.
+        iamService.registerPolicyResourceResolver("projects/*/locations/*/keyRings/*", this::getKeyRing);
+        iamService.registerPolicyResourceResolver("projects/*/locations/*/keyRings/*/cryptoKeys/*",
+                this::getCryptoKey);
     }
 
     // ── KeyRings ─────────────────────────────────────────────────────────────
@@ -129,6 +140,27 @@ public class CloudKmsService {
         locations.requireListLocation(LocationCatalog.locationOf(parent), KMS_LOCATION_KINDS);
         String prefix = parent + "/keyRings/";
         return keyRingStore.scan(k -> k.startsWith(prefix));
+    }
+
+    // ── IAM policies ─────────────────────────────────────────────────────────
+
+    /**
+     * Key ring and crypto key policies live in the shared IAM policy store, which checks that the
+     * resource exists under the policy lock. Cloud KMS never deletes a key ring or a crypto key, so
+     * a resource that passed the check still exists when the policy is written.
+     */
+    public StoredPolicy getIamPolicy(String resource) {
+        return iamService.getPolicy(resource);
+    }
+
+    /** Replaces the policy; a non-empty etag that is not the current one fails with ABORTED. */
+    public StoredPolicy setIamPolicy(String resource, StoredPolicy policy) {
+        return iamService.setPolicy(resource, policy);
+    }
+
+    /** A resource that does not exist yields no permissions rather than NOT_FOUND. */
+    public List<String> testIamPermissions(String resource, List<String> permissions) {
+        return iamService.testPermissions(resource, permissions);
     }
 
     private void requireKmsLocation(String parent) {

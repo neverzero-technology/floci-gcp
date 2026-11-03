@@ -214,6 +214,37 @@ Behavior to be aware of:
 - `CreateCryptoKeyVersion` on an `import_only` key fails with `FAILED_PRECONDITION`.
 - Re-importing into an existing version (`crypto_key_version`) is not supported.
 
+## IAM policies
+
+Key rings and crypto keys support `getIamPolicy`, `setIamPolicy` and `testIamPermissions`, over
+REST (`GET .../keyRings/{keyRing}:getIamPolicy`, `POST ...:setIamPolicy`,
+`POST ...:testIamPermissions`, and the same on `.../cryptoKeys/{cryptoKey}`) and over gRPC through
+the `google.iam.v1.IAMPolicy` mixin that the KMS client libraries call on the same channel. Both
+transports read and write the same policy, so Terraform's `google_kms_key_ring_iam_*` and
+`google_kms_crypto_key_iam_*` resources work.
+
+- A key ring or crypto key that has never had a policy returns an empty policy with etag `ACAB`.
+- `setIamPolicy` replaces the whole policy. A non-empty `etag` that is not the current one fails
+  with `ABORTED` (HTTP 409) and leaves the policy unchanged; without an `etag` the write always
+  succeeds.
+- Version 3 policies keep their conditional bindings and return them unchanged.
+- `getIamPolicy` and `setIamPolicy` on a key ring or crypto key that does not exist fail with
+  `NOT_FOUND`; `testIamPermissions` returns no permissions instead, as the API reference states.
+
+Deviations:
+
+- Policies are stored but not enforced: KMS calls are never denied because of them, and
+  `testIamPermissions` returns every permission requested on an existing resource. KMS is not
+  part of [IAM enforcement](iam.md#opt-in-enforcement).
+- `options.requestedPolicyVersion` is accepted but not applied, and a policy keeps the `version`
+  it was set with, so a version 3 policy without conditions is not reported as version 1.
+  Conditional bindings in a version 1 policy are not rejected.
+- `updateMask` and `auditConfigs` are ignored.
+- Import jobs have no IAM policy methods over REST. The gRPC mixin stores an import job policy
+  without checking that the import job exists.
+- The `NOT_FOUND`, `ABORTED` and `INVALID_ARGUMENT` messages are floci's own; production's
+  wording was not verified.
+
 ## Supported Operations
 
 - `CreateKeyRing`, `GetKeyRing`, `ListKeyRings`
@@ -225,8 +256,9 @@ Behavior to be aware of:
 - `GetPublicKey`, `AsymmetricSign`, `AsymmetricDecrypt`
 - `MacSign`, `MacVerify`
 - `GenerateRandomBytes`
+- `GetIamPolicy`, `SetIamPolicy`, `TestIamPermissions` on key rings and crypto keys
 
 ## Not Yet Supported
 
 `RawEncrypt`/`RawDecrypt`, re-importing key versions, RSA-PSS signing, post-quantum
-algorithms, HSM/EXTERNAL protection levels, and IAM policy storage.
+algorithms, HSM/EXTERNAL protection levels, IAM policy methods on import jobs over REST, and IAM enforcement.
