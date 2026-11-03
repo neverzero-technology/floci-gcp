@@ -71,4 +71,8 @@ provider "google" {
   service_usage_custom_endpoint    = "${var.endpoint}/v1/"
   resource_manager_custom_endpoint = "${var.endpoint}/v1/"
   cloud_billing_custom_endpoint    = "${var.endpoint}/v1/"
+
+  # Cloud Resource Manager v3: google_folder and google_folder_iam_member. The
+  # provider polls v3 folder operations through the v1 endpoint above.
+  resource_manager_v3_custom_endpoint = "${var.endpoint}/v3/"
 }

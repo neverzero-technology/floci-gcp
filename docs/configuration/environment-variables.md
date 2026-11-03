@@ -15,6 +15,7 @@ Variable names follow the config path, uppercased with dots and dashes replaced 
 | `FLOCI_GCP_HOSTNAME` | _(none)_ | Overrides only the hostname part of `FLOCI_GCP_BASE_URL`. Set to the Compose/container service name so other containers can reach floci-gcp by DNS |
 | `FLOCI_GCP_DEFAULT_PROJECT_ID` | `floci-local` | Default GCP project ID used when no project is specified in the request |
 | `FLOCI_GCP_PROJECTS_STRICT` | `false` | Only the default project and projects created via Resource Manager exist; REST requests for other projects return 403 `PERMISSION_DENIED` ([details](../services/resource-manager.md#strict-mode)) |
+| `FLOCI_GCP_PROJECTS_ORGANIZATIONS` | _(none)_ | Comma-separated numeric organization IDs that always exist, also in strict mode. Without strict mode any numeric organization ID is registered on first use ([details](../services/resource-manager.md#organizations)) |
 | `FLOCI_GCP_MAX_REQUEST_SIZE` | `512` | Maximum request body size, in **megabytes** (applies to uploads, e.g. GCS objects) |
 
 ---

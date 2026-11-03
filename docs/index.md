@@ -36,7 +36,7 @@ floci-gcp is a fast, free, and open-source local GCP emulator built for develope
 | **Firebase Auth (Identity Platform)** | REST | Identity Toolkit v1 sign-up/sign-in, emulator JWTs, admin user CRUD |
 | **Eventarc** | REST | Trigger CRUD; delivers CloudEvents from Pub/Sub and GCS events to Cloud Run and HTTP endpoints |
 | **IAM Credentials** | REST | `generateAccessToken` for service-account impersonation (shape-only stub tokens), `signBlob`, `signJwt` |
-| **Resource Manager** | REST | v1 projects: create, get by ID or number, list with filter, update, delete/undelete, ancestry, IAM policy mixins; optional strict project mode |
+| **Resource Manager** | REST | v1 projects: create, get by ID or number, list with filter, update, delete/undelete, ancestry, IAM policy mixins; v3 folders: create, get, list, search, rename, move, delete/undelete, IAM policy; v1 and v3 organizations: get, search, IAM policy; optional strict project mode |
 | **Cloud Billing** | REST | Project billing info stub for Terraform `google_project` billing links |
 
 ## Why floci-gcp?

@@ -6,6 +6,11 @@ floci-gcp emulates the Cloud Resource Manager v1 projects API
 sources use, and the one IaC providers call to look up a project before they manage
 project-scoped resources.
 
+It also emulates the v3 folders API and the v1 and v3 organizations get, search and IAM
+policy methods, which the Terraform `google_folder`, `google_folder_iam_*` and
+`google_organization_iam_*` resources and the `google_organization` data source call. See
+[Folders](#folders) and [Organizations](#organizations).
+
 Projects live in a shared project registry. It maps project IDs to project numbers,
 records name, labels, parent, lifecycle state and billing account, and persists with the configured storage
 mode.
@@ -15,7 +20,8 @@ mode.
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_GCP_SERVICES_RESOURCEMANAGER_ENABLED` | `true` | Enable/disable the Resource Manager API |
-| `FLOCI_GCP_PROJECTS_STRICT` | `false` | Only known projects exist (see [Strict mode](#strict-mode)) |
+| `FLOCI_GCP_PROJECTS_STRICT` | `false` | Only known projects and organizations exist (see [Strict mode](#strict-mode)) |
+| `FLOCI_GCP_PROJECTS_ORGANIZATIONS` | _(none)_ | Comma-separated organization IDs that always exist, also in strict mode (see [Organizations](#organizations)) |
 
 ## Endpoints
 
@@ -32,6 +38,24 @@ mode.
 | `POST` | `/v1/projects/{projectId}:getIamPolicy` | Project IAM policy |
 | `POST` | `/v1/projects/{projectId}:setIamPolicy` | |
 | `POST` | `/v1/projects/{projectId}:testIamPermissions` | |
+| `POST` | `/v3/folders` | Create. Returns an Operation that is already `done` |
+| `GET` | `/v3/folders?parent=&pageSize=&pageToken=&showDeleted=` | Direct children of an organization or folder |
+| `GET` | `/v3/folders:search?query=&pageSize=&pageToken=` | Search |
+| `GET` | `/v3/folders/{folderId}` | Get |
+| `PATCH` | `/v3/folders/{folderId}?updateMask=displayName` | Rename. Returns a `done` Operation |
+| `POST` | `/v3/folders/{folderId}:move` | Move. Returns a `done` Operation |
+| `DELETE` | `/v3/folders/{folderId}` | Moves the folder to `DELETE_REQUESTED`. Returns a `done` Operation |
+| `POST` | `/v3/folders/{folderId}:undelete` | Moves it back to `ACTIVE`. Returns a `done` Operation |
+| `POST` | `/v3/folders/{folderId}:getIamPolicy` | Folder IAM policy |
+| `POST` | `/v3/folders/{folderId}:setIamPolicy` | |
+| `POST` | `/v3/folders/{folderId}:testIamPermissions` | |
+| `GET` | `/v3/operations/{fc.*,fo.*}`, `/v1/operations/{fc.*,fo.*}` | Folder operation, on either version |
+| `GET` | `/v3/organizations/{organizationId}`, `/v1/organizations/{organizationId}` | Get |
+| `GET` | `/v3/organizations:search?query=` | Search |
+| `POST` | `/v1/organizations:search` | Search, with `filter` in the body |
+| `POST` | `/v3/organizations/{organizationId}:getIamPolicy`, and the same on `/v1` | Organization IAM policy |
+| `POST` | `/v3/organizations/{organizationId}:setIamPolicy`, and the same on `/v1` | |
+| `POST` | `/v3/organizations/{organizationId}:testIamPermissions`, and the same on `/v1` | |
 
 ### Create
 
@@ -58,6 +82,81 @@ match and `labels.color:*` matches any project with that label. The supported fi
 `name`, `id`, `labels.<key>`, `parent.type`, `parent.id` and `lifecycleState`. Any other
 field returns `400 INVALID_ARGUMENT`.
 
+## Folders
+
+Folders follow the v3 API. `parent` must be `organizations/{organizationId}` or
+`folders/{folderId}` with a numeric ID; anything else returns `400 INVALID_ARGUMENT`. The
+display name must match `[\p{L}\p{N}]([\p{L}\p{N}_\- ]{0,28}[\p{L}\p{N}])?`: start and end
+with a letter or digit, contain letters, digits, spaces, hyphens and underscores, and be at
+most 30 characters. A parent organization is resolved as described under
+[Organizations](#organizations); a parent folder must exist, or the request returns
+`403 PERMISSION_DENIED` with `The caller does not have permission`, the answer for any
+folder ID the emulator does not know.
+
+Folder IDs are random 12-digit numbers. Every folder method that returns an Operation
+completes before it returns, so the Operation is always `done` and carries the folder as
+its `response` (`@type` `google.cloud.resourcemanager.v3.Folder`):
+
+| Method | Operation name | `metadata` |
+|---|---|---|
+| create | `operations/fc.{folderId}` | `FolderOperation` with `operationType: CREATE` |
+| move | `operations/fo.{folderId}.{n}` | `FolderOperation` with `operationType: MOVE`, `sourceParent`, `destinationParent` |
+| patch | `operations/fo.{folderId}.{n}` | `UpdateFolderMetadata` |
+| delete | `operations/fo.{folderId}.{n}` | `DeleteFolderMetadata` |
+| undelete | `operations/fo.{folderId}.{n}` | `UndeleteFolderMetadata` |
+
+Operations can be read on `/v3/operations/...` and on `/v1/operations/...`. The Terraform
+provider polls folder operations through the v1 client.
+
+### Constraints
+
+These are enforced with `400 FAILED_PRECONDITION`:
+
+- Display names are unique among the `ACTIVE` folders that share a parent. Folders in
+  `DELETE_REQUESTED` do not count, so undeleting one fails if its name was reused.
+- At most 300 `ACTIVE` child folders per parent, and at most 10 levels of `ACTIVE` folders.
+- A move cannot place a folder under itself or one of its descendants.
+- A folder in `DELETE_REQUESTED` cannot be renamed, moved, or given children.
+- Delete requires that no child folder and no project with this folder as its parent is
+  `ACTIVE`. Undelete requires an `ACTIVE` parent.
+
+GCP attaches a `google.rpc.PreconditionFailure` to these errors whose violation type names
+the constraint, such as `FOLDER_NAME_UNIQUENESS_VIOLATION`. The emulator's error model has
+no such detail, so the violation type is appended to the message instead.
+
+### Lifecycle
+
+Delete moves an empty folder to `DELETE_REQUESTED` and sets `deleteTime`; deleting it again
+succeeds and changes nothing. The folder stays readable and is listed with
+`showDeleted=true`. Undelete restores it, and on an `ACTIVE` folder succeeds and changes
+nothing. The emulator never purges deleted folders.
+
+Folder create, move, delete and undelete, and project create, parent update and undelete,
+run under one lock, so a folder cannot be deleted while a project or child folder is
+being made active inside it.
+
+### Search
+
+`query` takes `field=value` or `field:value` terms on `displayName`, `parent` and `state`
+(also `lifecycleState`), joined by `AND` or spaces. A trailing `*` is a prefix match,
+values may be quoted (`displayName=\"Team A\"`), and comparisons ignore case. `OR` and
+`NOT` return `400 INVALID_ARGUMENT`.
+
+## Organizations
+
+Organizations cannot be created through the API, so the emulator learns them the way it
+learns projects. Without strict mode, any numeric organization ID becomes a known `ACTIVE`
+organization the first time a request names it, for example as a folder parent or in
+`GET /v3/organizations/{organizationId}`. IDs listed in `FLOCI_GCP_PROJECTS_ORGANIZATIONS`
+always exist. In strict mode only those listed IDs exist, and any other organization returns
+`403 PERMISSION_DENIED` with `The caller does not have permission`.
+
+An emulated organization has its ID as `displayName` and no directory customer ID. Search
+supports `domain` (matched against the display name) and `directoryCustomerId` /
+`owner.directoryCustomerId` (which match nothing). v3 returns `state`, `createTime`,
+`updateTime` and `etag`; v1 returns `lifecycleState` and `creationTime`. The v1 and v3 policy
+methods read and write the same policy.
+
 ## Projects you never created
 
 By default, every project ID that appears in a request is registered as an `ACTIVE`
@@ -79,7 +178,8 @@ permission`, which is how GCP answers for a project you cannot see.
 ## Strict mode
 
 With `FLOCI_GCP_PROJECTS_STRICT=true`, only the default project
-(`FLOCI_GCP_DEFAULT_PROJECT_ID`) and projects created through `POST /v1/projects` exist. A
+(`FLOCI_GCP_DEFAULT_PROJECT_ID`) and projects created through `POST /v1/projects` exist, and
+only the organizations listed in `FLOCI_GCP_PROJECTS_ORGANIZATIONS`. A
 REST request for any other project, whether it is a Resource Manager call, a project IAM
 policy call or a request to another service, returns:
 
@@ -112,6 +212,19 @@ through inheritance. They do not enforce permissions on unsupported services.
 A known project's number and its ID share one project policy: `GET /v1/projects/{number}`
 is authorized by the grants on `projects/{id}`. Organization and folder inheritance are not
 implemented.
+
+Folder methods check `resourcemanager.folders.get`, `list` (on the parent), `create` (on
+the parent), `update`, `move` (on the folder and on the destination), `delete`, `undelete`,
+`getIamPolicy` and `setIamPolicy`; reading a folder operation checks `get` on its folder.
+Organization methods check `resourcemanager.organizations.get`, `getIamPolicy` and
+`setIamPolicy`. Folder and organization search return only what the caller may get.
+Each folder or organization is evaluated against its own policy only. The catalog holds the
+folder and organization permissions of `roles/resourcemanager.folderAdmin`,
+`folderCreator`, `folderEditor`, `folderIamAdmin`, `folderMover`, `folderViewer`,
+`organizationAdmin` and `organizationViewer`; basic roles grant no folder or organization
+permission. Folder policies also use the shared IAM gRPC mixin. Organization policies are
+evaluated only on the Resource Manager REST methods; the shared mixin still fails closed for
+evaluated callers on `organizations/*`, as described in [IAM custom roles](iam.md#custom-roles).
 A project whose recorded parent is an organization can use that organization's
 [custom roles](iam.md#custom-roles).
 See [IAM enforcement and limitations](iam.md#opt-in-enforcement).
@@ -123,11 +236,16 @@ See [IAM enforcement and limitations](iam.md#opt-in-enforcement).
   does not reject unknown projects over gRPC.
 - Deleted projects are never purged, so a deleted project ID cannot be reused, just as in
   GCP.
-- `getAncestry` returns the project and its direct parent only. Folders and organizations
-  are not modelled, so the chain above the parent is unknown.
+- `getAncestry` walks the chain of known folders up to the organization. A parent folder
+  the emulator does not know ends the chain.
+- Project create and update accept a folder parent the emulator does not know, as they did
+  before folders were modelled; only a known folder in `DELETE_REQUESTED` is rejected.
 - The creation operation is rebuilt from the current project each time it is read, so it
   reflects later updates.
-- Resource Manager v3, folders, organizations, tags and org policies are not implemented.
+- Resource Manager v3 projects, tags, liens, capabilities, boundary configuration and org
+  policies are not implemented. Folder `tags` on create are ignored.
+- Folder operations finish synchronously, and request `etag` values on folders are not
+  checked. IAM `auditConfigs` are not stored.
 
 ## Quick Start
 
@@ -135,8 +253,21 @@ See [IAM enforcement and limitations](iam.md#opt-in-enforcement).
 
     ```hcl
     provider "google" {
-      resource_manager_custom_endpoint = "http://localhost:4588/v1/"
-      cloud_billing_custom_endpoint    = "http://localhost:4588/v1/"
+      resource_manager_custom_endpoint    = "http://localhost:4588/v1/"
+      resource_manager_v3_custom_endpoint = "http://localhost:4588/v3/"
+      cloud_billing_custom_endpoint       = "http://localhost:4588/v1/"
+    }
+
+    resource "google_folder" "platform" {
+      display_name        = "Platform"
+      parent              = "organizations/123456789012"
+      deletion_protection = false
+    }
+
+    resource "google_folder_iam_member" "viewer" {
+      folder = google_folder.platform.name
+      role   = "roles/resourcemanager.folderViewer"
+      member = "group:platform@example.com"
     }
 
     resource "google_project" "app" {
@@ -160,6 +291,11 @@ See [IAM enforcement and limitations](iam.md#opt-in-enforcement).
 
     curl http://localhost:4588/v1/projects/my-app-project
     curl 'http://localhost:4588/v1/projects?filter=labels.env:dev'
+
+    curl -X POST http://localhost:4588/v3/folders \
+      -H 'Content-Type: application/json' \
+      -d '{"displayName":"Platform","parent":"organizations/123456789012"}'
+    curl 'http://localhost:4588/v3/folders?parent=organizations/123456789012'
     ```
 
 See also [Cloud Billing](cloud-billing.md) for project billing links.

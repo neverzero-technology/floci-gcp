@@ -165,7 +165,9 @@ evaluated. These settings make it stricter. All are off by default.
 
 ## Known Gaps
 
-- No organizations or folders: every project stands alone, and there are no organization policies.
+- Folders and organizations exist in Resource Manager (see
+  [Folders](../services/resource-manager.md#folders)), but IAM policies are not inherited
+  through them, and there are no organization policies.
 - Services that store by resource name keep the project as the request names it, so
   `projects/{number}/...` and `projects/{id}/...` address different data there. A number
   maps to the ID only for the request project on REST (the services that store by request

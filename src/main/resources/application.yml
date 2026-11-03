@@ -65,6 +65,9 @@ floci-gcp:
     # When true, only the default project and projects created via Resource Manager exist;
     # REST requests for other projects return 403 PERMISSION_DENIED.
     strict: false
+    # Organization IDs that always exist, also in strict mode (FLOCI_GCP_PROJECTS_ORGANIZATIONS,
+    # comma-separated). Without strict mode any numeric organization ID is registered on first use.
+    # organizations: 123456789012
   storage:
     mode: memory
     persistent-path: ./data

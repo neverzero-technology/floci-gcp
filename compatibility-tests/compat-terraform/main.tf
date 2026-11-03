@@ -299,6 +299,35 @@ output "created_project_number" {
   value = google_project.compat.number
 }
 
+# ── Resource Manager v3 folders ───────────────────────────────────────────────
+# Organizations cannot be created through the API. floci-gcp registers a numeric
+# organization ID the first time a request names it.
+resource "google_folder" "platform" {
+  display_name        = "floci compat platform"
+  parent              = "organizations/123456789012"
+  deletion_protection = false
+}
+
+resource "google_folder" "team" {
+  display_name        = "floci compat team"
+  parent              = google_folder.platform.name
+  deletion_protection = false
+}
+
+resource "google_folder_iam_member" "team_viewer" {
+  folder = google_folder.team.name
+  role   = "roles/resourcemanager.folderViewer"
+  member = "group:platform@example.com"
+}
+
+output "folder_platform_name" {
+  value = google_folder.platform.name
+}
+
+output "folder_team_name" {
+  value = google_folder.team.name
+}
+
 # BigQuery: dataset defaults and table partitioning/clustering must round-trip, or the
 # provider plans a change on every run.
 resource "google_bigquery_dataset" "compat" {

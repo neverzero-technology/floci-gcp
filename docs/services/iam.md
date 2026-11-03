@@ -20,6 +20,7 @@ which mode is active and the supported service list.
 | Surface | IAM enforcement in `enforce` mode |
 |---|---|
 | Resource Manager v1 project metadata and project policies | REST JSON; project policies also use the shared IAM gRPC mixin |
+| Resource Manager v3 folders and v1/v3 organizations | REST JSON folder methods and policies (folder policies also use the shared IAM gRPC mixin), and organization get, search and policy methods. No inheritance through folders or organizations. See [Resource Manager IAM enforcement](resource-manager.md#iam-enforcement) |
 | Cloud Billing v1 project billing info | REST JSON `GET` only; the `PUT` update is not evaluated. See [Cloud Billing IAM enforcement](cloud-billing.md#iam-enforcement) |
 | Cloud Run v2 services and revisions | REST JSON service and revision operations; service-policy methods also use the shared IAM gRPC API. See [Cloud Run IAM enforcement](cloud-run.md#iam-enforcement-for-services) |
 | GCS buckets | Supported REST bucket metadata, IAM-policy, retention-lock, storage-layout, and notification operations; bucket `testIamPermissions` filters its response |
@@ -250,10 +251,11 @@ its parent.
 Role targets evaluate their parent's allow policy. The local evaluator exposes
 `resource.type = 'iam.googleapis.com/Role'` and the role name for conditions; create and
 list use the parent's attributes. Organization targets read the policy stored under
-`organizations/{organization}`. Resource Manager organization policy methods are not
-implemented, so evaluated callers are denied organization-role management unless an
-organization policy was stored through the shared IAM policy gRPC mixin, which accepts
-organization names only from anonymous and external callers.
+`organizations/{organization}`. Evaluated callers are denied organization-role management
+unless that policy grants them; it can be written through the Resource Manager
+[organization policy methods](resource-manager.md#organizations), which check
+`resourcemanager.organizations.setIamPolicy`, or through the shared IAM policy gRPC mixin,
+which accepts organization names only from anonymous and external callers.
 
 The [Google IAM roles and permissions reference](https://docs.cloud.google.com/iam/docs/roles-permissions/iam)
 defines these slices:
